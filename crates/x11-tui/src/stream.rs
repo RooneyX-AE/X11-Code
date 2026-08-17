@@ -26,10 +26,11 @@ pub async fn run_stream<W: Write>(out: &mut W, mut receiver: broadcast::Receiver
         let mut state = TuiState::default();
         loop {
             while let Ok(event) = receiver.try_recv() { state.apply(&event); }
-            while let Ok(request) = approval_requests.try_recv() { state.notice = Some(format!("approval queued: {}", request.tool)); }
-            let (width, height) = terminal::size()?;
-            draw_snapshot(out, &state, width, height)?;
-            if event::poll(Duration::from_millis(50))? {
+            while let Ok(request) = approval_requests.try_recv() {
+                state.notice = Some(format!("approval queued: {}", request.tool));
+            }
+
+            if event::poll(Duration::from_millis(0))? {
                 if let Some(command) = handle_key(event::read()?) {
                     match command {
                         UserCommand::Quit => return Ok(command),
@@ -46,22 +47,23 @@ pub async fn run_stream<W: Write>(out: &mut W, mut receiver: broadcast::Receiver
                     }
                 }
             }
+
+            let (width, height) = terminal::size()?;
+            draw_snapshot(out, &state, width, height)?;
+
             if matches!(state.state.as_str(), "completed" | "failed") {
                 while let Ok(event) = receiver.try_recv() { state.apply(&event); }
                 let (width, height) = terminal::size()?;
                 draw_snapshot(out, &state, width, height)?;
                 return Ok(UserCommand::Quit);
             }
-            match receiver.recv().await {
-                Ok(event) => state.apply(&event),
-                Err(broadcast::error::RecvError::Lagged(skipped)) => state.push_log(format!("event stream lagged; skipped {skipped} events")),
-                Err(broadcast::error::RecvError::Closed) => return Ok(UserCommand::Quit),
-            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }.await;
-    execute!(out, LeaveAlternateScreen)?;
-    terminal::disable_raw_mode()?;
-    result
+    let restore = execute!(out, LeaveAlternateScreen);
+    let raw = terminal::disable_raw_mode();
+    result.and(restore.map_err(Into::into)).and(raw.map_err(Into::into))
 }
 
 #[allow(dead_code)]
