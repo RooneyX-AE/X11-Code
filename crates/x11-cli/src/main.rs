@@ -44,13 +44,18 @@ async fn run_with_provider<P: x11_model::ModelProvider + 'static>(goal: String, 
         let approval_requests = agent.enable_interactive_approvals();
         let broker = agent.approvals.clone();
         let events = agent.subscribe();
+        let cancel = agent.cancel.clone();
         let handle = tokio::spawn(async move {
             let mut agent = agent;
             agent.run().await
         });
         let mut stdout = std::io::stdout();
         let user_command = run_stream(&mut stdout, events, broker, approval_requests).await?;
-        if matches!(user_command, x11_tui::stream::UserCommand::Quit) && !handle.is_finished() { handle.abort(); }
+        if matches!(user_command, x11_tui::stream::UserCommand::Quit) && !handle.is_finished() {
+            let _ = cancel.send(true);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &handle).await;
+            if !handle.is_finished() { handle.abort(); }
+        }
         match handle.await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(err)) if matches!(user_command, x11_tui::stream::UserCommand::Quit) => { if err.to_string().contains("cancel") { Ok(()) } else { Err(err) } }
