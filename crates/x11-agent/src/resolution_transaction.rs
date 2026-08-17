@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use tokio::fs;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSnapshot {
@@ -33,8 +34,13 @@ impl ResolutionTransaction {
 
     pub async fn rollback(snapshot: &FileSnapshot) -> Result<()> {
         if snapshot.existed {
-            if let Some(parent) = snapshot.path.parent() { fs::create_dir_all(parent).await.context("restore resolution parent")?; }
-            fs::write(&snapshot.path, &snapshot.content).await.context("restore resolution file")?;
+            let parent = snapshot.path.parent().context("snapshot target has no parent")?;
+            let tmp = parent.join(format!(".x11-rollback-{}.tmp", Uuid::new_v4()));
+            fs::write(&tmp, &snapshot.content).await.context("write rollback snapshot")?;
+            if let Err(error) = fs::rename(&tmp, &snapshot.path).await {
+                let _ = fs::remove_file(&tmp).await;
+                return Err(error).context("atomically restore resolution file");
+            }
         } else if fs::try_exists(&snapshot.path).await.context("check rollback target")? {
             fs::remove_file(&snapshot.path).await.context("remove newly created resolution file")?;
         }
@@ -50,14 +56,15 @@ impl ResolutionTransaction {
 }
 
 fn validate_relative(path: &Path) -> Result<()> {
-    if path.is_absolute() || path.components().any(|c| matches!(c, std::path::Component::ParentDir)) { anyhow::bail!("resolution path escapes workspace"); }
+    if path.is_absolute() || path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        anyhow::bail!("resolution path escapes workspace");
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::Permissions;
 
     #[test]
     fn rejects_parent_escape() {
@@ -76,5 +83,18 @@ mod tests {
         #[cfg(unix)] assert!(ResolutionTransaction::snapshot_file(&root, Path::new("link/secret.txt")).await.is_err());
         let _ = fs::remove_dir_all(&root).await;
         let _ = fs::remove_dir_all(&outside).await;
+    }
+
+    #[tokio::test]
+    async fn rollback_restores_original_bytes() {
+        let root = std::env::temp_dir().join(format!("x11-tx-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).await.unwrap();
+        let path = root.join("file.txt");
+        fs::write(&path, b"original").await.unwrap();
+        let snapshot = ResolutionTransaction::snapshot_file(&root, Path::new("file.txt")).await.unwrap();
+        fs::write(&path, b"mutated").await.unwrap();
+        ResolutionTransaction::rollback(&snapshot).await.unwrap();
+        assert!(ResolutionTransaction::verify_unchanged(&snapshot).await.unwrap());
+        let _ = fs::remove_dir_all(root).await;
     }
 }
