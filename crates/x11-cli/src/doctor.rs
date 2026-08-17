@@ -98,10 +98,6 @@ fn config_candidates(workspace: &Path) -> Vec<PathBuf> {
 }
 
 fn check_mcp_config(workspace: &Path) -> Check {
-    let mut seen = Vec::new();
-    for path in config_candidates(workspace) {
-        if !path.is_file() || !seen.iter().any(|p: &PathBuf| p == &path) { continue; }
-    }
     let files = config_candidates(workspace).into_iter().filter(|p| p.is_file()).collect::<Vec<_>>();
     if files.is_empty() {
         return Check { name: "mcp-config", status: Status::Ok, detail: "no MCP configuration (optional)".into() };
