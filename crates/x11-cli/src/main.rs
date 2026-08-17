@@ -6,7 +6,7 @@ use x11_agent::{AgentConfig, AgentRuntime};
 use x11_core::mode::AgentMode;
 use x11_model::{MockProvider, OpenAiCompatible};
 use x11_session::{store::SessionStore, Session};
-use x11_tui::run as run_tui;
+use x11_tui::stream::run_stream;
 
 #[derive(Debug, Parser)]
 #[command(name="x11", version, about="X11 Code autonomous coding agent")]
@@ -38,6 +38,28 @@ fn parse_mode(mode: &str) -> Result<AgentMode> {
 }
 fn store_for(workspace: PathBuf) -> SessionStore { SessionStore::new(workspace.join(".x11/sessions")) }
 
+async fn run_with_provider<P: x11_model::ModelProvider + 'static>(goal: String, cfg: AgentConfig, provider: P, tui: bool) -> Result<()> {
+    let agent = AgentRuntime::new(goal, cfg, provider);
+    let receiver = agent.subscribe();
+    if tui {
+        let handle = tokio::spawn(async move {
+            let mut agent = agent;
+            let result = agent.run().await;
+            (result, agent.session.events.len())
+        });
+        let mut stdout = std::io::stdout();
+        let _ = run_stream(&mut stdout, receiver).await?;
+        handle.abort();
+        let _ = handle.await;
+    } else {
+        let mut agent = agent;
+        let result = agent.run().await;
+        for e in &agent.session.events { println!("{:?}", e); }
+        result.map(|text| { if !text.is_empty() { println!("\n{text}"); } })?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main()->Result<()>{
     tracing_subscriber::fmt().with_env_filter("x11=info").init();
@@ -49,13 +71,9 @@ async fn main()->Result<()>{
             if let Some(n)=max_iterations{cfg.max_iterations=n.max(1);} if let Some(ms)=verification_timeout_ms{cfg.verification_timeout_ms=ms.clamp(100,600_000);} if !verify_commands.is_empty(){cfg.verification_commands=verify_commands;}
             cfg.session_path=session.or_else(||Some(Session::default_path(&cfg.workspace)));
             if let (Ok(key),Ok(base))=(std::env::var("X11_API_KEY"),std::env::var("X11_BASE_URL")) {
-                let mut agent=AgentRuntime::new(goal,cfg,OpenAiCompatible::new(base,key)); let result=agent.run().await;
-                if tui { run_tui(agent.session.events.clone().into_iter())?; } else { for e in &agent.session.events{println!("{:?}",e);} result.map(|text|{if !text.is_empty(){println!("\n{text}")}})?; }
-                if tui { result?; }
+                run_with_provider(goal,cfg,OpenAiCompatible::new(base,key),tui).await?;
             } else {
-                let mut agent=AgentRuntime::new(goal,cfg,MockProvider); let result=agent.run().await;
-                if tui { run_tui(agent.session.events.clone().into_iter())?; } else { for e in &agent.session.events{println!("{:?}",e);} result?; }
-                if tui { result?; }
+                run_with_provider(goal,cfg,MockProvider,tui).await?;
             }
         }
         Some(Command::Sessions{command})=>{
