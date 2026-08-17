@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use std::{env, fs, path::{Path, PathBuf}, process::Stdio};
 use tokio::{process::Command, time::{timeout, Duration}};
-use crate::{node_manager, project_env, sandbox};
+use x11_agent::tool_executor::sandbox;
+use crate::{node_manager, project_env};
 use crate::runtime::{self, RuntimeKind, RuntimeStatus, Source};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,8 +104,8 @@ fn find_program(name: &str) -> Result<PathBuf> {
 
 fn runtime_path(status: &RuntimeStatus) -> Option<PathBuf> { status.executable.as_ref()?.parent().map(Path::to_path_buf) }
 
-pub async fn execute(plan: &ExecutionPlan, timeout_ms: u64, dry_run: bool, sandbox_mode: sandbox::SandboxMode) -> Result<i32> {
-    let (program, args, backend) = sandbox::wrap_command(sandbox_mode, &plan.cwd, &plan.program, &plan.args)?;
+pub async fn execute(plan: &ExecutionPlan, timeout_ms: u64, dry_run: bool, sandbox_mode: sandbox::Mode) -> Result<i32> {
+    let (program, args, backend) = sandbox::wrap(sandbox_mode, &plan.cwd, &plan.program, &plan.args)?;
     println!("$ {} {}", program.display(), args.join(" "));
     println!("cwd: {}", plan.cwd.display());
     println!("sandbox: {:?}", backend);
