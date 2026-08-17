@@ -210,11 +210,33 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+#[cfg(unix)]
+fn copy_dir(source: &Path, dest: &Path) -> Result<()> {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?; let from = entry.path(); let to = dest.join(entry.file_name());
+        let meta = fs::symlink_metadata(&from)?;
+        if meta.file_type().is_symlink() {
+            let target = fs::read_link(&from)?;
+            symlink(target, &to)?;
+        } else if meta.is_dir() {
+            copy_dir(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)?;
+            fs::set_permissions(&to, fs::Permissions::from_mode(meta.permissions().mode()))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn copy_dir(source: &Path, dest: &Path) -> Result<()> {
     fs::create_dir_all(dest)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?; let from = entry.path(); let to = dest.join(entry.file_name());
-        if from.is_dir() { copy_dir(&from, &to)?; } else { fs::copy(from, to)?; }
+        let meta = fs::symlink_metadata(&from)?;
+        if meta.is_dir() { copy_dir(&from, &to)?; } else { fs::copy(&from, &to)?; }
     }
     Ok(())
 }
