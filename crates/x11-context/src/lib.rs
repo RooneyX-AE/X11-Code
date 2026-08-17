@@ -18,9 +18,10 @@ impl Context {
     pub fn push(&mut self, role: impl Into<String>, content: impl Into<String>) {
         self.items.push(ContextItem { role: role.into(), content: content.into(), tool_calls: Vec::new(), tool_call_id: None });
     }
-    pub fn push_assistant_tool_calls(&mut self, tool_calls: Vec<ToolCall>) {
-        self.items.push(ContextItem { role: "assistant".into(), content: String::new(), tool_calls, tool_call_id: None });
+    pub fn push_assistant_message(&mut self, content: impl Into<String>, tool_calls: Vec<ToolCall>) {
+        self.items.push(ContextItem { role: "assistant".into(), content: content.into(), tool_calls, tool_call_id: None });
     }
+    pub fn push_assistant_tool_calls(&mut self, tool_calls: Vec<ToolCall>) { self.push_assistant_message("", tool_calls); }
     pub fn push_tool_result(&mut self, tool_call_id: impl Into<String>, content: impl Into<String>) {
         self.items.push(ContextItem { role: "tool".into(), content: content.into(), tool_calls: Vec::new(), tool_call_id: Some(tool_call_id.into()) });
     }
@@ -36,6 +37,8 @@ mod tests {
     use super::*;
     #[test]
     fn context_estimates_and_compacts_without_losing_goal(){let mut c=Context::default();c.push("system","critical rules");c.push("user","original goal: fix the bug");for i in 0..20{c.push("assistant",format!("historical message {i} {}","x".repeat(100)));}let before=c.items().len();c.compact(100);assert!(c.items().len()<before);assert_eq!(c.items()[0].content,"critical rules");assert_eq!(c.items()[1].content,"original goal: fix the bug");}
+    #[test]
+    fn assistant_text_and_tool_calls_stay_together(){let mut c=Context::default();c.push_assistant_message("I will inspect the file",vec![ToolCall{id:"call-1".into(),name:"read_file".into(),arguments:serde_json::json!({"path":"a"})}]);let m=c.to_messages();assert_eq!(m[0].content,"I will inspect the file");assert_eq!(m[0].tool_calls[0].id,"call-1");}
     #[test]
     fn tool_protocol_is_preserved(){let mut c=Context::default();c.push_assistant_tool_calls(vec![ToolCall{id:"call-1".into(),name:"read_file".into(),arguments:serde_json::json!({"path":"a"})}]);c.push_tool_result("call-1","file contents");let m=c.to_messages();assert_eq!(m[0].tool_calls[0].id,"call-1");assert_eq!(m[1].tool_call_id.as_deref(),Some("call-1"));}
 }
