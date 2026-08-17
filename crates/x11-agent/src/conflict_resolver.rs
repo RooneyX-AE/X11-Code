@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
+#[path = "conflict_resolution.rs"]
+pub mod resolution;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileChange {
     pub agent_id: String,
