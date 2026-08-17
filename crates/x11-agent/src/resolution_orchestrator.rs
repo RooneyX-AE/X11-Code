@@ -72,6 +72,18 @@ impl ResolutionOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conflict_resolver::{ConflictReport, MergeDecision};
+    use std::fs;
+
+    fn fixture() -> (PathBuf, ConflictHunk, ResolutionProposal) {
+        let workspace = std::env::temp_dir().join(format!("x11-resolution-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("x.rs"), "a\nb\nc\n").unwrap();
+        let hunk = ConflictHunk { path: "x.rs".into(), start_line: 2, end_line: 2, agent_ids: vec!["a".into(), "b".into()], before: "b".into(), alternatives: vec!["B".into()] };
+        let proposal = ResolutionProposal { path: "x.rs".into(), start_line: 2, end_line: 2, source_agents: vec!["a".into(), "b".into()], replacement: "B".into(), rationale: "merge".into() };
+        (workspace, hunk, proposal)
+    }
+
     #[test]
     fn retry_is_bounded() {
         let cfg = ResolutionConfig { max_attempts: 2 };
@@ -79,9 +91,21 @@ mod tests {
         assert!(ResolutionOrchestrator::can_retry(1, cfg));
         assert!(!ResolutionOrchestrator::can_retry(2, cfg));
     }
+
     #[test]
     fn rejection_and_rollback_are_terminal_states() {
         assert_eq!(ResolutionOrchestrator::reject(2, vec!["bad".into()]).state, ResolutionState::Rejected);
         assert_eq!(ResolutionOrchestrator::rolled_back(2, vec!["verification failed".into()]).state, ResolutionState::RolledBack);
+    }
+
+    #[tokio::test]
+    async fn failed_verification_restores_only_resolution_file() {
+        let (workspace, hunk, proposal) = fixture();
+        fs::write(workspace.join("other.txt"), "keep me\n").unwrap();
+        let result = ResolutionOrchestrator::apply_and_verify(&workspace, &hunk, &proposal, || async { Ok(false) }).await.unwrap();
+        assert_eq!(result.state, ResolutionState::RolledBack);
+        assert_eq!(fs::read_to_string(workspace.join("x.rs")).unwrap(), "a\nb\nc\n");
+        assert_eq!(fs::read_to_string(workspace.join("other.txt")).unwrap(), "keep me\n");
+        let _ = fs::remove_dir_all(workspace);
     }
 }
