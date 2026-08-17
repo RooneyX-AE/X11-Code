@@ -34,17 +34,20 @@ fn temp_workspace() -> PathBuf {
     std::env::temp_dir().join(format!("x11-e2e-{}", Uuid::new_v4()))
 }
 
+fn parent_config(workspace: PathBuf) -> AgentConfig {
+    let mut config = AgentConfig::default();
+    config.workspace = workspace;
+    config.model = "mock".into();
+    config.verification_commands.clear();
+    config
+}
+
 #[tokio::test]
 async fn swarm_runs_end_to_end_and_reaches_tui_state() {
     let workspace = temp_workspace();
     fs::create_dir_all(&workspace).await.unwrap();
 
-    let mut config = AgentConfig::default();
-    config.workspace = workspace.clone();
-    config.model = "mock".into();
-    config.verification_commands.clear();
-
-    let parent = AgentRuntime::new("run an e2e swarm", config, MockProvider);
+    let parent = AgentRuntime::new("run an e2e swarm", parent_config(workspace.clone()), MockProvider);
     let bus = SwarmEventBus::new(256);
     let mut bridge = LiveSwarmBridge::subscribe(&bus);
     let state_path = workspace.join("swarm.json");
@@ -76,7 +79,7 @@ async fn swarm_runs_end_to_end_and_reaches_tui_state() {
     assert!(fs::try_exists(&state_path).await.unwrap());
 
     let kinds = {
-        let mut replay = SwarmEventBus::new(64);
+        let replay = SwarmEventBus::new(64);
         let mut rx = replay.subscribe();
         replay.emit(x11_agent::swarm_events::SwarmEvent::new(
             report.swarm_id,
@@ -90,6 +93,66 @@ async fn swarm_runs_end_to_end_and_reaches_tui_state() {
     };
     assert!(kinds.contains(&SwarmEventKind::SwarmStarted));
     assert!(kinds.contains(&SwarmEventKind::SwarmCompleted));
+
+    fs::remove_dir_all(workspace).await.unwrap();
+}
+
+#[tokio::test]
+async fn swarm_resume_skips_completed_child_and_emits_resume_event() {
+    let workspace = temp_workspace();
+    fs::create_dir_all(&workspace).await.unwrap();
+
+    let parent = AgentRuntime::new("resume an e2e swarm", parent_config(workspace.clone()), MockProvider);
+    let state_path = workspace.join("resume.json");
+    let swarm_id = Uuid::new_v4();
+    let bus = SwarmEventBus::new(64);
+    let mut rx = bus.subscribe();
+
+    let first = SwarmAdapter::run_with_parent(
+        &parent,
+        vec![spec("explorer")],
+        AgentManagerConfig {
+            max_concurrency: 1,
+            timeout_ms: 30_000,
+            event_bus: Some(bus.clone()),
+            swarm_id: Some(swarm_id),
+            state_path: Some(state_path.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.succeeded, 1);
+
+    while rx.try_recv().is_ok() {}
+
+    let resumed = SwarmAdapter::run_with_parent(
+        &parent,
+        vec![spec("explorer")],
+        AgentManagerConfig {
+            max_concurrency: 1,
+            timeout_ms: 30_000,
+            event_bus: Some(bus.clone()),
+            swarm_id: Some(swarm_id),
+            state_path: Some(state_path.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resumed.succeeded, 1);
+    let mut saw_resume = false;
+    let mut saw_new_task_start = false;
+    while let Ok(event) = rx.try_recv() {
+        match event.kind {
+            SwarmEventKind::SwarmResumed => saw_resume = true,
+            SwarmEventKind::TaskStarted => saw_new_task_start = true,
+            _ => {}
+        }
+    }
+    assert!(saw_resume);
+    assert!(!saw_new_task_start, "completed child should not execute again during resume");
 
     fs::remove_dir_all(workspace).await.unwrap();
 }
