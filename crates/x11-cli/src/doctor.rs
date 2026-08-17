@@ -1,13 +1,9 @@
 use std::{env, fs, path::{Path, PathBuf}, process::Command};
 use crate::runtime;
+use x11_agent::tool_executor::sandbox;
 
 #[derive(Debug, Clone)]
-pub struct Check {
-    pub name: &'static str,
-    pub status: Status,
-    pub detail: String,
-}
-
+pub struct Check { pub name: &'static str, pub status: Status, pub detail: String }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status { Ok, Warn, Fail }
 
@@ -83,45 +79,16 @@ fn check_project_environment(workspace: &Path) -> Check {
         let detail = if python.is_file() { format!("Python .venv ready; source: {lock}") } else { format!("Python .venv missing; run `x11 project env python`; source: {lock}") };
         return Check { name: "project-env", status, detail };
     }
-    if cargo.is_file() {
-        return Check { name: "project-env", status: Status::Ok, detail: "Rust Cargo project detected".into() };
-    }
+    if cargo.is_file() { return Check { name: "project-env", status: Status::Ok, detail: "Rust Cargo project detected".into() }; }
     Check { name: "project-env", status: Status::Warn, detail: "no recognized project manifest".into() }
 }
 
 fn check_sandbox() -> Check {
-    if cfg!(target_os = "linux") {
-        let bwrap = Command::new("bwrap").arg("--version").output();
-        if !matches!(bwrap, Ok(ref output) if output.status.success()) {
-            return Check { name: "sandbox", status: Status::Warn, detail: "Bubblewrap unavailable; strict sandbox cannot run".into() };
-        }
-        let probe = Command::new("bwrap")
-            .args([
-                "--die-with-parent",
-                "--unshare-user",
-                "--unshare-pid",
-                "--unshare-net",
-                "--proc", "/proc",
-                "--dev", "/dev",
-                "--ro-bind", "/usr", "/usr",
-                "--ro-bind", "/bin", "/bin",
-                "/bin/true",
-            ])
-            .output();
-        return match probe {
-            Ok(output) if output.status.success() => Check { name: "sandbox", status: Status::Ok, detail: "Bubblewrap preflight passed (user/pid/network namespaces)".into() },
-            Ok(output) => Check { name: "sandbox", status: Status::Warn, detail: format!("Bubblewrap present but preflight failed: {}", String::from_utf8_lossy(&output.stderr).trim()) },
-            Err(error) => Check { name: "sandbox", status: Status::Warn, detail: format!("Bubblewrap preflight could not run: {error}") },
-        };
-    }
-    if cfg!(target_os = "macos") {
-        let available = Path::new("/usr/bin/sandbox-exec").is_file();
-        return Check { name: "sandbox", status: if available { Status::Ok } else { Status::Warn }, detail: if available { "macOS Seatbelt executable available".into() } else { "macOS sandbox backend unavailable".into() } };
-    }
-    if cfg!(target_os = "windows") {
-        return Check { name: "sandbox", status: Status::Warn, detail: "Windows process isolation backend is not fully implemented yet".into() };
-    }
-    Check { name: "sandbox", status: Status::Warn, detail: "no supported sandbox backend for this platform".into() }
+    let capability = sandbox::detect();
+    let available = !matches!(capability.backend, sandbox::Backend::None);
+    let status = if capability.backend == sandbox::Backend::WindowsAppContainer { Status::Warn } else if available { Status::Ok } else { Status::Warn };
+    let detail = format!("backend={:?}; fs={}; net={}; proc={}; {}", capability.backend, capability.filesystem_isolation, capability.network_isolation, capability.process_isolation, capability.reason);
+    Check { name: "sandbox", status, detail }
 }
 
 fn check_shell() -> Check {
