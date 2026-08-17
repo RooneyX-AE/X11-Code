@@ -3,13 +3,13 @@ use serde_json::Value;
 use std::{env, fs, path::{Path, PathBuf}, process::Stdio};
 use tokio::{process::Command, time::{timeout, Duration}};
 use crate::runtime::{self, RuntimeKind, RuntimeStatus, Source};
+use crate::project_env;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectKind { Node, Python, Rust, Unknown }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NodeManager { Npm, Pnpm, Yarn }
-
 impl NodeManager { fn name(self) -> &'static str { match self { Self::Npm => "npm", Self::Pnpm => "pnpm", Self::Yarn => "yarn" } } }
 
 #[derive(Debug, Clone)]
@@ -38,7 +38,6 @@ pub fn plan(workspace: &Path, kind: ProjectKind, action: &str) -> Result<Executi
 }
 
 enum NodeAction { Install, Test, Build }
-
 fn node_tool(workspace: &Path, action: NodeAction) -> Result<(PathBuf, Vec<String>, Option<RuntimeStatus>)> {
     let status = runtime_status(workspace, RuntimeKind::Node)?;
     anyhow::ensure!(status.source != Source::Missing, "Node.js runtime is missing; run `x11 runtime install node <version>`");
@@ -54,23 +53,19 @@ fn node_tool(workspace: &Path, action: NodeAction) -> Result<(PathBuf, Vec<Strin
     let tool = find_manager_program(manager, runtime_path(&status).as_deref())?;
     Ok((tool, args.into_iter().map(str::to_owned).collect(), Some(status)))
 }
-
 fn detect_node_manager(workspace: &Path) -> Result<NodeManager> {
     if let Some(manager) = package_manager_field(workspace)? { return Ok(manager); }
     if workspace.join("pnpm-lock.yaml").is_file() { return Ok(NodeManager::Pnpm); }
     if workspace.join("yarn.lock").is_file() { return Ok(NodeManager::Yarn); }
     Ok(NodeManager::Npm)
 }
-
 fn package_manager_field(workspace: &Path) -> Result<Option<NodeManager>> {
-    let path = workspace.join("package.json");
-    if !path.is_file() { return Ok(None); }
+    let path = workspace.join("package.json"); if !path.is_file() { return Ok(None); }
     let value: Value = serde_json::from_str(&fs::read_to_string(path).context("read package.json")?).context("parse package.json")?;
     let Some(field) = value.get("packageManager").and_then(Value::as_str) else { return Ok(None); };
     let name = field.split_once('@').map(|(n, _)| n).unwrap_or(field).to_ascii_lowercase();
     Ok(Some(match name.as_str() { "npm" => NodeManager::Npm, "pnpm" => NodeManager::Pnpm, "yarn" => NodeManager::Yarn, other => anyhow::bail!("unsupported packageManager '{other}' in package.json") }))
 }
-
 fn find_manager_program(manager: NodeManager, runtime_bin: Option<&Path>) -> Result<PathBuf> {
     let name = manager.name();
     if let Some(bin) = runtime_bin { let direct = bin.join(if cfg!(windows) { format!("{name}.cmd") } else { name.to_owned() }); if direct.is_file() { return Ok(direct); } }
@@ -78,39 +73,28 @@ fn find_manager_program(manager: NodeManager, runtime_bin: Option<&Path>) -> Res
 }
 
 enum PythonAction { Install, Test }
-
 fn python_tool(workspace: &Path, action: PythonAction) -> Result<(PathBuf, Vec<String>, Option<RuntimeStatus>)> {
     let status = runtime_status(workspace, RuntimeKind::Python)?;
     anyhow::ensure!(status.source != Source::Missing, "Python runtime is missing; run `x11 runtime install python <version>`");
-    if let Some(venv) = find_project_venv(workspace) {
-        let python = venv_python(&venv)?;
-        let args = match action { PythonAction::Install => python_install_args(workspace)?, PythonAction::Test => vec!["-m".into(), "pytest".into()] };
-        return Ok((python, args, Some(status)));
-    }
-    anyhow::bail!("Python project environment is missing at `.venv`; create it with `x11 project env python` before running project commands")
+    anyhow::ensure!(project_env::python_env_ready(workspace), "Python project environment is missing at `.venv`; create it with `x11 project env python`");
+    let python = project_env::python_path(workspace);
+    let (program, args) = match action {
+        PythonAction::Test => (python.clone(), vec!["-m".into(), "pytest".into()]),
+        PythonAction::Install if workspace.join("uv.lock").is_file() && workspace.join("pyproject.toml").is_file() => {
+            let uv = find_program("uv")?;
+            (uv, vec!["sync".into(), "--locked".into()])
+        }
+        PythonAction::Install => (python.clone(), vec!["-m".into(), "pip".into(), "install".into(), "-r".into(), "requirements.txt".into()]),
+    };
+    Ok((program, args, Some(status)))
 }
-
-fn python_install_args(workspace: &Path) -> Result<Vec<String>> {
-    if workspace.join("uv.lock").is_file() && workspace.join("pyproject.toml").is_file() { return Ok(vec!["-m".into(), "uv".into(), "sync".into(), "--locked".into()]); }
-    if workspace.join("requirements.txt").is_file() { return Ok(vec!["-m".into(), "pip".into(), "install".into(), "-r".into(), "requirements.txt".into()]); }
-    anyhow::bail!("Python install requires pyproject.toml+uv.lock or requirements.txt")
-}
-
-fn find_project_venv(workspace: &Path) -> Option<PathBuf> {
-    let path = workspace.join(".venv");
-    path.is_dir().then_some(path)
-}
-
-fn venv_python(venv: &Path) -> Result<PathBuf> {
-    let path = if cfg!(windows) { venv.join("Scripts/python.exe") } else { venv.join("bin/python") };
-    anyhow::ensure!(path.is_file(), "`.venv` exists but Python executable is missing");
-    Ok(path)
-}
-
 fn runtime_status(workspace: &Path, kind: RuntimeKind) -> Result<RuntimeStatus> { runtime::inspect(workspace).into_iter().find(|s| s.kind == kind).context("requested runtime was not detected for this workspace") }
 fn find_program(name: &str) -> Result<PathBuf> {
     let path = env::var_os("PATH").context("PATH is unavailable")?;
-    for root in env::split_paths(&path) { let candidate = root.join(name); if candidate.is_file() { return Ok(candidate); } if cfg!(windows) { for suffix in [".exe", ".cmd"] { let candidate = root.join(format!("{name}{suffix}")); if candidate.is_file() { return Ok(candidate); } } } }
+    for root in env::split_paths(&path) {
+        let candidate = root.join(name); if candidate.is_file() { return Ok(candidate); }
+        if cfg!(windows) { for suffix in [".exe", ".cmd"] { let candidate = root.join(format!("{name}{suffix}")); if candidate.is_file() { return Ok(candidate); } } }
+    }
     anyhow::bail!("required executable '{name}' is not available on PATH")
 }
 fn runtime_path(status: &RuntimeStatus) -> Option<PathBuf> { status.executable.as_ref()?.parent().map(Path::to_path_buf) }
