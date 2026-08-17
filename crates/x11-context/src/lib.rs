@@ -25,31 +25,10 @@ impl Context {
         self.items.push(ContextItem { role: "tool".into(), content: content.into(), tool_calls: Vec::new(), tool_call_id: Some(tool_call_id.into()) });
     }
     pub fn items(&self)->&[ContextItem]{&self.items}
-    pub fn estimated_tokens(&self)->usize {
-        self.items.iter().map(|i| {
-            let calls = i.tool_calls.iter().map(|c| c.name.len() + c.arguments.to_string().len() + c.id.len()).sum::<usize>();
-            (i.role.len()+i.content.len()+calls+3)/4
-        }).sum()
-    }
-
-    pub fn compact(&mut self, max_tokens: usize) {
-        if self.items.len() <= 2 || self.estimated_tokens() <= max_tokens { return; }
-        let protected = self.protected_prefix_len();
-        while self.estimated_tokens() > max_tokens && self.items.len() > protected + 1 {
-            self.items.remove(protected);
-        }
-    }
-
-    fn protected_prefix_len(&self) -> usize {
-        let mut protected=0usize;
-        for item in &self.items {
-            if protected < 2 && (item.role == "system" || (protected == 1 && item.role == "user")) { protected += 1; }
-            else { break; }
-        }
-        protected
-    }
-
-    pub fn to_messages(&self)->Vec<Message>{self.items.iter().map(|i|Message{role:i.role.clone(),content:i.content.clone(),tool_calls:i.tool_calls.clone(),tool_call_id:i.tool_call_id.clone()}).collect()}
+    pub fn estimated_tokens(&self)->usize { self.items.iter().map(|i| { let calls=i.tool_calls.iter().map(|c|c.name.len()+c.arguments.to_string().len()+c.id.len()).sum::<usize>(); (i.role.len()+i.content.len()+calls+3)/4 }).sum() }
+    pub fn compact(&mut self, max_tokens: usize) { if self.items.len()<=2||self.estimated_tokens()<=max_tokens{return;}let protected=self.protected_prefix_len();while self.estimated_tokens()>max_tokens&&self.items.len()>protected+1{self.items.remove(protected);}}
+    fn protected_prefix_len(&self)->usize{let mut protected=0usize;for item in &self.items{if protected<2&&(item.role=="system"||(protected==1&&item.role=="user")){protected+=1;}else{break;}}protected}
+    pub fn to_messages(&self)->Vec<Message>{self.items.iter().map(|i|match i.role.as_str(){"assistant" if !i.tool_calls.is_empty()=>Message::assistant_with_tools(i.content.clone(),&i.tool_calls),"tool"=>Message::tool(i.tool_call_id.clone().unwrap_or_default(),i.content.clone()),"system"=>Message::system(i.content.clone()),"user"=>Message::user(i.content.clone()),_=>Message::assistant(i.content.clone())}).collect()}
 }
 
 #[cfg(test)]
