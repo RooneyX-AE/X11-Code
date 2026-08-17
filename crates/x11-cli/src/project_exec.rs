@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::{env, fs, path::{Path, PathBuf}, process::Stdio};
 use tokio::{process::Command, time::{timeout, Duration}};
-use crate::{node_manager, project_env};
+use crate::{node_manager, project_env, sandbox};
 use crate::runtime::{self, RuntimeKind, RuntimeStatus, Source};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,9 +63,7 @@ fn wrap_project_local_yarn(
 ) -> Result<(PathBuf, Vec<String>)> {
     let is_cjs = manager.kind == node_manager::ManagerKind::Yarn
         && manager_program.extension().and_then(|ext| ext.to_str()) == Some("cjs");
-    if !is_cjs {
-        return Ok((manager_program, args.into_iter().map(str::to_owned).collect()));
-    }
+    if !is_cjs { return Ok((manager_program, args.into_iter().map(str::to_owned).collect())); }
     let node_program = node.executable.clone().context("managed Node executable missing for project-local Yarn")?;
     let mut wrapped = Vec::with_capacity(args.len() + 1);
     wrapped.push(manager_program.to_string_lossy().into_owned());
@@ -105,11 +103,14 @@ fn find_program(name: &str) -> Result<PathBuf> {
 
 fn runtime_path(status: &RuntimeStatus) -> Option<PathBuf> { status.executable.as_ref()?.parent().map(Path::to_path_buf) }
 
-pub async fn execute(plan: &ExecutionPlan, timeout_ms: u64, dry_run: bool) -> Result<i32> {
-    println!("$ {} {}", plan.program.display(), plan.args.join(" ")); println!("cwd: {}", plan.cwd.display());
+pub async fn execute(plan: &ExecutionPlan, timeout_ms: u64, dry_run: bool, sandbox_mode: sandbox::SandboxMode) -> Result<i32> {
+    let (program, args, backend) = sandbox::wrap_command(sandbox_mode, &plan.cwd, &plan.program, &plan.args)?;
+    println!("$ {} {}", program.display(), args.join(" "));
+    println!("cwd: {}", plan.cwd.display());
+    println!("sandbox: {:?}", backend);
     if dry_run { return Ok(0); }
-    let mut cmd = Command::new(&plan.program);
-    cmd.args(&plan.args).current_dir(&plan.cwd).stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    let mut cmd = Command::new(&program);
+    cmd.args(&args).current_dir(&plan.cwd).stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
     if let Some(status) = &plan.runtime {
         if let Some(bin) = runtime_path(status) {
             let mut paths = vec![bin];
@@ -141,18 +142,10 @@ mod tests {
     fn local_yarn_cjs_is_wrapped_by_node() {
         let manager = node_manager::ManagerResolution {
             kind: node_manager::ManagerKind::Yarn,
-            requested: Some("4.0.0".into()),
-            detected_version: Some("4.0.0".into()),
-            program: Some(PathBuf::from(".yarn/releases/yarn-4.0.0.cjs")),
-            state: node_manager::ResolveState::Ready,
+            requested: Some("4.0.0".into()), detected_version: Some("4.0.0".into()),
+            program: Some(PathBuf::from(".yarn/releases/yarn-4.0.0.cjs")), state: node_manager::ResolveState::Ready,
         };
-        let node = RuntimeStatus {
-            kind: RuntimeKind::Node,
-            source: Source::Managed,
-            executable: Some(PathBuf::from("/x11/node/bin/node")),
-            version: Some("24.0.0".into()),
-            requested: None,
-        };
+        let node = RuntimeStatus { kind: RuntimeKind::Node, source: Source::Managed, executable: Some(PathBuf::from("/x11/node/bin/node")), version: Some("24.0.0".into()), requested: None };
         let (program, args) = wrap_project_local_yarn(&manager, manager.program.clone().unwrap(), vec!["test"], &node).unwrap();
         assert_eq!(program, PathBuf::from("/x11/node/bin/node"));
         assert_eq!(args, vec![".yarn/releases/yarn-4.0.0.cjs", "test"]);
