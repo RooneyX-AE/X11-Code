@@ -3,7 +3,14 @@ use std::sync::Arc;
 use uuid::Uuid;
 use x11_core::SubagentSpec;
 use x11_model::ModelProvider;
-use crate::{manager::{AgentManager, AgentManagerConfig, SubagentResult, SwarmReport}, repair::{RepairConfig, RepairPlan}, swarm_events::{SwarmEvent, SwarmEventKind}, swarm_reviewer::{ReviewResult, SwarmReviewer}, AgentConfig, AgentRuntime};
+use crate::{
+    manager::{AgentManager, AgentManagerConfig, SubagentResult, SwarmReport},
+    repair::{RepairConfig, RepairPlan},
+    swarm_event_bus::{remove_runtime_bus, runtime_bus},
+    swarm_events::{SwarmEvent, SwarmEventKind},
+    swarm_reviewer::{ReviewResult, SwarmReviewer},
+    AgentConfig, AgentRuntime,
+};
 
 pub struct SwarmAdapter;
 
@@ -13,8 +20,15 @@ impl SwarmAdapter {
         config.cancellation = Some(parent.cancel.clone());
         if config.state_path.is_none() { config.state_path = Some(parent.swarm_state_path()); }
         if config.swarm_id.is_none() { config.swarm_id = Some(Uuid::new_v4()); }
+
+        let session_id = parent.snapshot.session_id;
+        let bus = runtime_bus(session_id);
+        config.event_bus = Some((*bus).clone());
+
         let manager = AgentManager::new(Arc::clone(&parent.provider), parent.config.workspace.clone(), AgentConfig { ..parent.config.clone() }, config);
-        manager.run_report(specs).await
+        let result = manager.run_report(specs).await;
+        remove_runtime_bus(session_id);
+        result
     }
 
     pub fn review(report: &SwarmReport) -> ReviewResult { SwarmReviewer::review(report) }
@@ -51,15 +65,18 @@ mod tests {
     use std::{collections::BTreeSet, path::PathBuf};
     use x11_core::SubagentRole;
     use x11_model::MockProvider;
+    use crate::swarm_event_bus::runtime_bus;
 
     fn spec() -> SubagentSpec { SubagentSpec { id:"explorer".into(), role:SubagentRole::Explorer, goal:"inspect".into(), max_iterations:1, model:"default".into(), token_budget:4_000, tool_budget:4, allowed_tools:BTreeSet::from(["read_file".into()]), dependencies:BTreeSet::new(), priority:0, workspace_scope:None } }
 
     #[tokio::test]
-    async fn adapter_inherits_parent_controls() {
+    async fn adapter_inherits_parent_controls_and_emits_runtime_events() {
         let mut cfg=AgentConfig::default(); cfg.workspace=PathBuf::from(".");
         let parent=AgentRuntime::new("parent",cfg,MockProvider);
+        let mut rx = runtime_bus(parent.snapshot.session_id).subscribe();
         let report=SwarmAdapter::run_with_parent(&parent,vec![spec()],AgentManagerConfig{max_concurrency:1,timeout_ms:5_000,..Default::default()}).await.unwrap();
         assert_eq!(report.results.len(),1); assert_eq!(report.succeeded,1); assert_eq!(SwarmAdapter::review(&report).verdict,crate::swarm_reviewer::ReviewVerdict::Accept); assert_ne!(report.swarm_id,Uuid::nil());
+        assert!(rx.try_recv().is_err(), "runtime bus must be cleaned after the swarm ends");
     }
 
     #[test]
