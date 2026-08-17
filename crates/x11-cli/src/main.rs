@@ -16,6 +16,9 @@ enum Command{
         #[arg(long)] yes:bool,
         #[arg(long)] max_iterations:Option<u32>,
         #[arg(long)] session:Option<PathBuf>,
+        #[arg(long="verify", value_name="COMMAND", action=clap::ArgAction::Append)] verify_commands:Vec<String>,
+        #[arg(long)] hooks:bool,
+        #[arg(long)] verification_timeout_ms:Option<u64>,
     }
 }
 
@@ -24,12 +27,15 @@ async fn main()->Result<()>{
     tracing_subscriber::fmt().with_env_filter("x11=info").init();
     let cli=Cli::parse();
     match cli.command{
-        Some(Command::Run{goal,workspace,model,yes,max_iterations,session})=>{
+        Some(Command::Run{goal,workspace,model,yes,max_iterations,session,verify_commands,hooks,verification_timeout_ms})=>{
             let mut cfg=AgentConfig::default();
             cfg.workspace=workspace.unwrap_or(std::env::current_dir()?);
             if let Some(m)=model{cfg.model=m;}
             cfg.auto_approve=yes;
+            cfg.hooks_enabled=hooks;
             if let Some(n)=max_iterations{cfg.max_iterations=n.max(1);}
+            if let Some(ms)=verification_timeout_ms{cfg.verification_timeout_ms=ms.clamp(100,600_000);}
+            if !verify_commands.is_empty(){cfg.verification_commands=verify_commands;}
             cfg.session_path=session.or_else(||Some(cfg.workspace.join(".x11/session.json")));
             if let (Ok(key),Ok(base))=(std::env::var("X11_API_KEY"),std::env::var("X11_BASE_URL")){
                 let provider=OpenAiCompatible::new(base,key);
