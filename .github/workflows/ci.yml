@@ -23,3 +23,10 @@ jobs:
       - name: Quality audit
         shell: bash
         run: bash scripts/quality-audit.sh
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect unused Cargo dependencies
+        uses: bnjbvr/cargo-machete@main
