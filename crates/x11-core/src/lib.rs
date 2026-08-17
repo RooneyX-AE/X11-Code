@@ -2,6 +2,7 @@ pub mod mode;
 pub mod orchestration;
 pub mod task_graph;
 pub mod verification;
+pub mod verification_engine;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
