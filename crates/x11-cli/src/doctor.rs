@@ -122,10 +122,12 @@ fn check_mcp_config(workspace: &Path) -> Check {
 
 fn check_sandbox() -> Check {
     let capability = sandbox::detect();
-    let available = !matches!(capability.backend, sandbox::Backend::None);
-    let status = if capability.backend == sandbox::Backend::WindowsAppContainer { Status::Warn } else if available { Status::Ok } else { Status::Warn };
-    let detail = format!("backend={:?}; fs={}; net={}; proc={}; {}", capability.backend, capability.filesystem_isolation, capability.network_isolation, capability.process_isolation, capability.reason);
-    Check { name: "sandbox", status, detail }
+    let detail = if capability.backend == sandbox::Backend::None {
+        format!("backend=none; fs=false; net=false; proc=false; {}", capability.reason)
+    } else {
+        format!("backend={:?}; capability detected; runtime preflight not verified; fs={} net={} proc={}; {}", capability.backend, capability.filesystem_isolation, capability.network_isolation, capability.process_isolation, capability.reason)
+    };
+    Check { name: "sandbox", status: Status::Warn, detail }
 }
 
 fn check_shell() -> Check {
