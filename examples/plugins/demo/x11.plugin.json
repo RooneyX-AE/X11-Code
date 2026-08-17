@@ -1,0 +1,22 @@
+{
+  "name": "x11-demo",
+  "version": "0.1.0",
+  "description": "Example X11 Code plugin",
+  "skills": ["skills"],
+  "agents": ["agents"],
+  "commands": ["commands"],
+  "system_prompt": "Prefer narrow changes and explicit verification.",
+  "mcp_servers": {
+    "demo": {
+      "command": "demo-mcp"
+    }
+  },
+  "hooks": [
+    {
+      "event": "PreToolUse",
+      "matcher": "shell",
+      "command": "./hooks/check.sh",
+      "timeout_seconds": 5
+    }
+  ]
+}
