@@ -14,6 +14,9 @@ pub mod resolution_apply;
 pub mod resolution_orchestrator;
 pub mod resolution_provider;
 pub mod resolution_transaction;
+pub mod swarm_events;
+pub mod swarm_event_bus;
+pub mod swarm_view;
 
 use anyhow::{Context, Result};
 use std::{path::PathBuf, sync::Arc, time::Duration};
