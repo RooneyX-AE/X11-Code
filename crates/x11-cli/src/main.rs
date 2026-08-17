@@ -1,4 +1,5 @@
 mod doctor;
+mod node_manager;
 mod project_env;
 mod project_exec;
 mod python_runtime;
@@ -15,14 +16,7 @@ use x11_model::{MockProvider, OpenAiCompatible};
 use x11_session::{store::SessionStore, Session};
 use x11_tui::stream::run_stream;
 #[derive(Debug, Parser)] #[command(name="x11", version, about="X11 Code autonomous coding agent")] struct Cli { #[command(subcommand)] command: Option<Command> }
-#[derive(Debug, Subcommand)] enum Command {
- Run { goal:String, #[arg(short,long)] workspace:Option<PathBuf>, #[arg(long)] model:Option<String>, #[arg(long)] yes:bool, #[arg(long)] max_iterations:Option<u32>, #[arg(long)] session:Option<PathBuf>, #[arg(long="verify",value_name="COMMAND",action=clap::ArgAction::Append)] verify_commands:Vec<String>, #[arg(long)] hooks:bool, #[arg(long)] verification_timeout_ms:Option<u64>, #[arg(long,default_value="normal")] mode:String, #[arg(long)] tui:bool },
- Doctor { #[arg(long)] quiet: bool, #[arg(long)] json: bool },
- Update { #[arg(long)] check: bool },
- Runtime { #[command(subcommand)] command: RuntimeCommand },
- Project { #[command(subcommand)] command: ProjectCommand },
- Sessions { #[command(subcommand)] command:SessionCommand },
-}
+#[derive(Debug, Subcommand)] enum Command { Run { goal:String, #[arg(short,long)] workspace:Option<PathBuf>, #[arg(long)] model:Option<String>, #[arg(long)] yes:bool, #[arg(long)] max_iterations:Option<u32>, #[arg(long)] session:Option<PathBuf>, #[arg(long="verify",value_name="COMMAND",action=clap::ArgAction::Append)] verify_commands:Vec<String>, #[arg(long)] hooks:bool, #[arg(long)] verification_timeout_ms:Option<u64>, #[arg(long,default_value="normal")] mode:String, #[arg(long)] tui:bool }, Doctor { #[arg(long)] quiet: bool, #[arg(long)] json: bool }, Update { #[arg(long)] check: bool }, Runtime { #[command(subcommand)] command: RuntimeCommand }, Project { #[command(subcommand)] command: ProjectCommand }, Sessions { #[command(subcommand)] command:SessionCommand } }
 #[derive(Debug, Subcommand)] enum RuntimeCommand { Status { #[arg(long)] json: bool }, Install { runtime:String, version:String } }
 #[derive(Debug, Subcommand)] enum ProjectCommand { Detect { #[arg(short,long)] workspace:Option<PathBuf> }, Env { #[command(subcommand)] command: ProjectEnvCommand }, Run { action:String, #[arg(short,long)] workspace:Option<PathBuf>, #[arg(long)] timeout_ms:Option<u64>, #[arg(long)] execute:bool } }
 #[derive(Debug, Subcommand)] enum ProjectEnvCommand { Status { #[arg(short,long)] workspace:Option<PathBuf>, #[arg(long)] json:bool }, Python { #[arg(short,long)] workspace:Option<PathBuf> } }
