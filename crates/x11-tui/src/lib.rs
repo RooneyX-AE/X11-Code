@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod cosmic;
+pub mod stream;
 
 use crossterm::{cursor::MoveTo,event::{self, Event, KeyCode, KeyEvent, KeyModifiers},execute,style::{Attribute, Print, SetAttribute},terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen}};
 use std::{collections::VecDeque, io::{self, Write}, time::Duration};
@@ -10,7 +11,7 @@ use crate::cosmic::CosmicField;
 const MAX_LOG_LINES: usize = 500;
 
 #[derive(Debug, Clone)] pub struct ApprovalRequest { pub call_id: uuid::Uuid, pub tool: String, pub reason: String }
-#[derive(Debug, Default)] pub struct TuiState { pub state:String,pub logs:VecDeque<String>,pub agents:Vec<(String,String,String)>,pub approval:Option<ApprovalRequest>,pub todo:Vec<(String,String)>,pub cosmic:CosmicField,pub command_mode:bool,pub input:String,pub notice:Option<String> }
+#[derive(Debug)] pub struct TuiState { pub state:String,pub logs:VecDeque<String>,pub agents:Vec<(String,String,String)>,pub approval:Option<ApprovalRequest>,pub todo:Vec<(String,String)>,pub cosmic:CosmicField,pub command_mode:bool,pub input:String,pub notice:Option<String> }
 impl Default for TuiState { fn default()->Self{Self{state:"idle".into(),logs:VecDeque::new(),agents:Vec::new(),approval:None,todo:Vec::new(),cosmic:CosmicField::new(120,36),command_mode:false,input:String::new(),notice:None}} }
 impl TuiState {
  pub fn apply(&mut self,event:&AgentEvent){match event{
