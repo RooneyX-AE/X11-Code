@@ -2,41 +2,26 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SubagentRole {
-    Explorer,
-    Planner,
-    Implementer,
-    Reviewer,
-    Tester,
-}
+pub enum SubagentRole { Explorer, Planner, Implementer, Reviewer, Tester }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentSpec {
     pub id: String,
     pub role: SubagentRole,
     pub goal: String,
-    #[serde(default)]
-    pub max_iterations: u32,
+    #[serde(default)] pub max_iterations: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum HookEvent {
-    BeforeRun,
-    AfterRun,
-    BeforeTool,
-    AfterTool,
-    OnError,
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HookEvent { BeforeRun, AfterRun, BeforeTool, AfterTool, OnError }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hook {
     pub name: String,
     pub event: HookEvent,
     pub command: String,
-    #[serde(default = "enabled")]
-    pub enabled: bool,
+    #[serde(default = "enabled")] pub enabled: bool,
 }
-
 fn enabled() -> bool { true }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,8 +29,7 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub instructions: String,
-    #[serde(default)]
-    pub tool_hints: Vec<String>,
+    #[serde(default)] pub tool_hints: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -56,23 +40,12 @@ pub struct Orchestrator {
 }
 
 impl Orchestrator {
-    pub fn register_subagent(&mut self, spec: SubagentSpec) {
-        self.subagents.insert(spec.id.clone(), spec);
-    }
-
-    pub fn register_skill(&mut self, skill: Skill) {
-        self.skills.insert(skill.name.clone(), skill);
-    }
-
-    pub fn register_hook(&mut self, hook: Hook) {
-        self.hooks.push(hook);
-    }
-
+    pub fn register_subagent(&mut self, spec: SubagentSpec) { self.subagents.insert(spec.id.clone(), spec); }
+    pub fn register_skill(&mut self, skill: Skill) { self.skills.insert(skill.name.clone(), skill); }
+    pub fn register_hook(&mut self, hook: Hook) { self.hooks.push(hook); }
     pub fn subagents(&self) -> impl Iterator<Item = &SubagentSpec> { self.subagents.values() }
     pub fn skills(&self) -> impl Iterator<Item = &Skill> { self.skills.values() }
-    pub fn hooks(&self, event: HookEvent) -> impl Iterator<Item = &Hook> {
-        self.hooks.iter().filter(move |h| h.enabled && h.event == event)
-    }
+    pub fn hooks(&self, event: HookEvent) -> impl Iterator<Item = &Hook> { self.hooks.iter().filter(move |h| h.enabled && h.event == event) }
 
     pub fn default_subagents() -> Vec<SubagentSpec> {
         [
@@ -81,9 +54,7 @@ impl Orchestrator {
             ("implementer", SubagentRole::Implementer, "Implement the requested changes with small edits."),
             ("reviewer", SubagentRole::Reviewer, "Review changes for correctness, regressions, and safety."),
             ("tester", SubagentRole::Tester, "Run targeted tests or checks and report failures."),
-        ].into_iter().map(|(id, role, goal)| SubagentSpec {
-            id: id.into(), role, goal: goal.into(), max_iterations: 8,
-        }).collect()
+        ].into_iter().map(|(id, role, goal)| SubagentSpec { id: id.into(), role, goal: goal.into(), max_iterations: 8 }).collect()
     }
 
     pub fn install_defaults(&mut self) {
@@ -106,12 +77,14 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn defaults_are_useful() {
+    fn defaults_are_useful() { let mut o = Orchestrator::default(); o.install_defaults(); assert_eq!(o.subagents().count(), 5); assert!(o.skills().any(|s| s.name == "safe-edit")); }
+    #[test]
+    fn hook_filtering_is_deterministic() {
         let mut o = Orchestrator::default();
-        o.install_defaults();
-        assert_eq!(o.subagents().count(), 5);
-        assert!(o.skills().any(|s| s.name == "safe-edit"));
+        o.register_hook(Hook { name: "before".into(), event: HookEvent::BeforeRun, command: "true".into(), enabled: true });
+        o.register_hook(Hook { name: "disabled".into(), event: HookEvent::BeforeRun, command: "false".into(), enabled: false });
+        assert_eq!(o.hooks(HookEvent::BeforeRun).count(), 1);
+        assert_eq!(o.hooks(HookEvent::AfterRun).count(), 0);
     }
 }
