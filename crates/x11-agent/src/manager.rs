@@ -6,7 +6,7 @@ use x11_model::ModelProvider;
 use x11_permissions::Policy;
 use x11_protocol::AgentEvent;
 
-use crate::{workspace_lock::WorkspaceLockManager, AgentConfig, AgentRuntime};
+use crate::{swarm_state::{ResultSnapshot, SwarmState, SwarmTaskStatus}, workspace_lock::WorkspaceLockManager, AgentConfig, AgentRuntime};
 use crate::tool_executor::ToolExecutor;
 
 #[derive(Debug, Clone)]
@@ -17,8 +17,8 @@ pub struct SwarmReport { pub results:Vec<SubagentResult>, pub succeeded:usize, p
 impl SwarmReport { pub fn all_success(&self)->bool{self.failed==0} pub fn summary(&self)->String{format!("swarm complete: {} succeeded, {} failed, {} conflict candidate(s)",self.succeeded,self.failed,self.conflict_candidates.len())} }
 
 #[derive(Debug, Clone)]
-pub struct AgentManagerConfig { pub max_concurrency:usize, pub timeout_ms:u64, pub inherited_policy:Option<Policy>, pub cancellation:Option<watch::Sender<bool>> }
-impl Default for AgentManagerConfig { fn default()->Self{Self{max_concurrency:4,timeout_ms:7_200_000,inherited_policy:None,cancellation:None}} }
+pub struct AgentManagerConfig { pub max_concurrency:usize, pub timeout_ms:u64, pub inherited_policy:Option<Policy>, pub cancellation:Option<watch::Sender<bool>>, pub state_path:Option<PathBuf> }
+impl Default for AgentManagerConfig { fn default()->Self{Self{max_concurrency:4,timeout_ms:7_200_000,inherited_policy:None,cancellation:None,state_path:None}} }
 
 pub struct AgentManager<P:ModelProvider+'static>{provider:Arc<P>,workspace:PathBuf,base_config:AgentConfig,config:AgentManagerConfig,locks:WorkspaceLockManager}
 impl<P:ModelProvider+'static> AgentManager<P>{
@@ -41,14 +41,47 @@ impl<P:ModelProvider+'static> AgentManager<P>{
   let mut results=Vec::with_capacity(total);while let Some(joined)=jobs.join_next().await{results.push(joined.map_err(|e|anyhow!("subagent task join failure: {e}"))??);}results.sort_by(|a,b|a.id.cmp(&b.id));Ok(results)
  }
  pub async fn run_parallel(&self,specs:Vec<SubagentSpec>)->Result<Vec<SubagentResult>>{Ok(self.run_report(specs).await?.results)}
- pub async fn run_report(&self,specs:Vec<SubagentSpec>)->Result<SwarmReport>{let mut pending:BTreeMap<String,SubagentSpec>=specs.into_iter().map(|s|(s.id.clone(),s)).collect();let mut completed=BTreeSet::new();let mut results=Vec::new();while !pending.is_empty(){let mut ready=pending.values().filter(|s|s.dependencies.iter().all(|d|completed.contains(d))).cloned().collect::<Vec<_>>();if ready.is_empty(){let unresolved=pending.keys().cloned().collect::<Vec<_>>().join(", ");anyhow::bail!("subagent dependency cycle or missing dependency among: {unresolved}");}ready.sort_by(|a,b|b.priority.cmp(&a.priority).then_with(||a.id.cmp(&b.id)));let batch=self.run_batch(ready).await?;for result in &batch{completed.insert(result.id.clone());pending.remove(&result.id);}results.extend(batch);}results.sort_by(|a,b|a.id.cmp(&b.id));let succeeded=results.iter().filter(|r|r.success).count();let failed=results.len()-succeeded;let mut paths:BTreeMap<String,Vec<String>>=BTreeMap::new();for result in &results{for path in &result.files_changed{paths.entry(path.clone()).or_default().push(result.id.clone());}}let conflict_candidates=paths.into_iter().filter_map(|(path,owners)|if owners.len()>1{Some(format!("{path} <- {}",owners.join(", ")))}else{None}).collect();Ok(SwarmReport{results,succeeded,failed,conflict_candidates})}
+ pub async fn run_report(&self,specs:Vec<SubagentSpec>)->Result<SwarmReport>{self.run_report_internal(specs,self.config.state_path.clone()).await}
+ pub async fn run_report_resumable(&self,specs:Vec<SubagentSpec>,state_path:impl Into<PathBuf>)->Result<SwarmReport>{self.run_report_internal(specs,Some(state_path.into())).await}
+ async fn run_report_internal(&self,specs:Vec<SubagentSpec>,state_path:Option<PathBuf>)->Result<SwarmReport>{
+  let task_ids=specs.iter().map(|s|s.id.clone()).collect::<Vec<_>>();
+  let mut state=if let Some(path)=&state_path{match SwarmState::load(path).await{Ok(mut loaded)=>{for task in loaded.tasks.values_mut(){if matches!(task.status,SwarmTaskStatus::Running){task.status=SwarmTaskStatus::Pending;}}loaded},Err(_)=>SwarmState::new("swarm",task_ids.clone())}}else{SwarmState::new("swarm",task_ids.clone())};
+  let known=task_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
+  for id in state.tasks.keys(){if !known.contains(id.as_str()){anyhow::bail!("persisted swarm task '{}' is absent from supplied specs",id);}}
+  let mut completed=state.tasks.iter().filter(|(_,t)|matches!(t.status,SwarmTaskStatus::Succeeded)).map(|(id,_)|id.clone()).collect::<BTreeSet<_>>();
+  let mut pending: BTreeMap<String,SubagentSpec>=specs.into_iter().filter(|s|!completed.contains(&s.id)).map(|s|(s.id.clone(),s)).collect();
+  if let Some(path)=&state_path{state.save_atomic(path).await?;}
+  let mut results=Vec::new();
+  while !pending.is_empty(){
+   let mut ready=pending.values().filter(|s|s.dependencies.iter().all(|d|completed.contains(d))).cloned().collect::<Vec<_>>();
+   if ready.is_empty(){let unresolved=pending.keys().cloned().collect::<Vec<_>>().join(", ");anyhow::bail!("subagent dependency cycle or missing dependency among: {unresolved}");}
+   ready.sort_by(|a,b|b.priority.cmp(&a.priority).then_with(||a.id.cmp(&b.id)));
+   if let Some(path)=&state_path{for spec in &ready{let _=state.mark_running(&spec.id,uuid::Uuid::nil());}state.save_atomic(path).await?;}
+   let batch=self.run_batch(ready).await?;
+   for result in &batch{
+    completed.insert(result.id.clone());pending.remove(&result.id);
+    if let Some(path)=&state_path{let _=state.mark_finished(&result.id,ResultSnapshot{success:result.success,cancelled:false,output:Some(result.output.clone()),error:(!result.success).then(||result.output.clone()),files_changed:result.files_changed.clone()});state.save_atomic(path).await?;}
+   }
+   results.extend(batch);
+   if self.is_cancelled(){break;}
+  }
+  results.sort_by(|a,b|a.id.cmp(&b.id));
+  let persisted_success=state.tasks.values().filter(|t|matches!(t.status,SwarmTaskStatus::Succeeded)).count();
+  let failed=results.iter().filter(|r|!r.success).count();
+  let succeeded=persisted_success;
+  let mut paths:BTreeMap<String,Vec<String>>=BTreeMap::new();for result in &results{for path in &result.files_changed{paths.entry(path.clone()).or_default().push(result.id.clone());}}
+  let conflict_candidates=paths.into_iter().filter_map(|(path,owners)|if owners.len()>1{Some(format!("{path} <- {}",owners.join(", ")))}else{None}).collect();
+  Ok(SwarmReport{results,succeeded,failed,conflict_candidates})
+ }
+ fn is_cancelled(&self)->bool{self.config.cancellation.as_ref().map(|tx|*tx.borrow()).unwrap_or(false)}
 }
 
 #[cfg(test)]
 mod tests{use super::*;use x11_model::MockProvider;
  fn spec(id:&str,role:SubagentRole,priority:i32,deps:&[&str])->SubagentSpec{SubagentSpec{id:id.into(),role,goal:id.into(),max_iterations:1,model:"default".into(),token_budget:4_000,tool_budget:8,allowed_tools:BTreeSet::new(),dependencies:deps.iter().map(|d|d.to_string()).collect(),priority,workspace_scope:None}}
  #[tokio::test] async fn manager_runs_isolated_agents_in_parallel(){let manager=AgentManager::new(Arc::new(MockProvider),PathBuf::from("."),AgentConfig::default(),AgentManagerConfig{max_concurrency:2,..Default::default()});let results=manager.run_parallel(vec![spec("b",SubagentRole::Explorer,0,&[]),spec("a",SubagentRole::Tester,0,&[])]).await.unwrap();assert_eq!(results.len(),2);assert_eq!(results[0].id,"a");assert_eq!(results[1].id,"b");assert!(results.iter().all(|r|r.success));assert_ne!(results[0].session_id,results[1].session_id);}
- #[tokio::test] async fn dependencies_are_scheduled_in_batches(){let manager=AgentManager::new(Arc::new(MockProvider),PathBuf::from("."),AgentConfig::default(),AgentManagerConfig{max_concurrency:2,..Default::default()});let report=manager.run_report(vec![spec("review",SubagentRole::Reviewer,0,&["impl"]),spec("impl",SubagentRole::Implementer,1,&[])]).await.unwrap();assert_eq!(report.results.len(),2);assert_eq!(report.failed,0);}
+ #[tokio::test] async fn dependencies_are_scheduled_in_batches(){let manager=AgentManager::new(Arc::new(MockProvider),PathBuf::from("."),AgentConfig{..Default::default()},AgentManagerConfig{max_concurrency:2,..Default::default()});let report=manager.run_report(vec![spec("review",SubagentRole::Reviewer,0,&["impl"]),spec("impl",SubagentRole::Implementer,1,&[])]).await.unwrap();assert_eq!(report.results.len(),2);assert_eq!(report.failed,0);}
  #[tokio::test] async fn missing_dependency_is_rejected(){let manager=AgentManager::new(Arc::new(MockProvider),PathBuf::from("."),AgentConfig::default(),AgentManagerConfig::default());let err=manager.run_parallel(vec![spec("a",SubagentRole::Explorer,0,&["missing"])]).await.unwrap_err();assert!(err.to_string().contains("dependency"));}
+ #[tokio::test] async fn persisted_successes_are_skipped_on_resume(){let dir=std::env::temp_dir().join(format!("x11-swarm-resume-{}",uuid::Uuid::new_v4()));let path=dir.join("state.json");let mut state=SwarmState::new("swarm",vec!["a".into(),"b".into()]);state.mark_finished("a",ResultSnapshot{success:true,cancelled:false,output:Some("done".into()),error:None,files_changed:Vec::new()}).unwrap();state.save_atomic(&path).await.unwrap();let manager=AgentManager::new(Arc::new(MockProvider),PathBuf::from("."),AgentConfig::default(),AgentManagerConfig::default());let report=manager.run_report_resumable(vec![spec("a",SubagentRole::Explorer,0,&[]),spec("b",SubagentRole::Explorer,0,&[])],&path).await.unwrap();assert_eq!(report.succeeded,2);let _=tokio::fs::remove_dir_all(dir).await;}
  #[test] fn report_aggregates_counts(){let report=SwarmReport{results:Vec::new(),succeeded:0,failed:0,conflict_candidates:Vec::new()};assert!(report.all_success());assert_eq!(report.summary(),"swarm complete: 0 succeeded, 0 failed, 0 conflict candidate(s)");}
 }
