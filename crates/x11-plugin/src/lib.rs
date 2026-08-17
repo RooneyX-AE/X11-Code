@@ -1,3 +1,4 @@
+pub mod hook_executor;
 pub mod security;
 
 use anyhow::{Context, Result};
