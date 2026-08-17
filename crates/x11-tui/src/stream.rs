@@ -1,10 +1,9 @@
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::{event::{self, Event, KeyCode, KeyEvent, KeyModifiers}, execute, terminal::{self, EnterAlternateScreen, LeaveAlternateScreen, Clear, ClearType}};
 use std::io::{self, Write};
 use std::time::Duration;
 use tokio::sync::broadcast;
 use x11_protocol::AgentEvent;
-
 use crate::{draw_snapshot, TuiState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,35 +19,37 @@ pub fn handle_key(event: Event) -> Option<UserCommand> {
     }
 }
 
-pub async fn run_stream<W: Write>(
-    out: &mut W,
-    mut receiver: broadcast::Receiver<AgentEvent>,
-) -> Result<UserCommand> {
-    let mut state = TuiState::default();
-    loop {
-        while let Ok(event) = receiver.try_recv() {
-            state.apply(&event);
-        }
-        let (width, height) = crossterm::terminal::size()?;
-        draw_snapshot(out, &state, width, height)?;
-
-        if event::poll(Duration::from_millis(50))? {
-            if let Some(command) = handle_key(event::read()?) {
-                if matches!(command, UserCommand::Quit) { return Ok(command); }
-                if state.approval.is_some() { return Ok(command); }
+pub async fn run_stream<W: Write>(out: &mut W, mut receiver: broadcast::Receiver<AgentEvent>) -> Result<UserCommand> {
+    terminal::enable_raw_mode()?;
+    execute!(out, EnterAlternateScreen, Clear(ClearType::All))?;
+    let result = async {
+        let mut state = TuiState::default();
+        loop {
+            while let Ok(event) = receiver.try_recv() { state.apply(&event); }
+            let (width, height) = terminal::size()?;
+            draw_snapshot(out, &state, width, height)?;
+            if event::poll(Duration::from_millis(50))? {
+                if let Some(command) = handle_key(event::read()?) {
+                    if matches!(command, UserCommand::Quit) { return Ok(command); }
+                    if state.approval.is_some() { return Ok(command); }
+                }
+            }
+            if matches!(state.state.as_str(), "completed" | "failed") {
+                while let Ok(event) = receiver.try_recv() { state.apply(&event); }
+                let (width, height) = terminal::size()?;
+                draw_snapshot(out, &state, width, height)?;
+                return Ok(UserCommand::Quit);
+            }
+            match receiver.recv().await {
+                Ok(event) => state.apply(&event),
+                Err(broadcast::error::RecvError::Lagged(skipped)) => state.push_log(format!("event stream lagged; skipped {skipped} events")),
+                Err(broadcast::error::RecvError::Closed) => return Ok(UserCommand::Quit),
             }
         }
-
-        if matches!(state.state.as_str(), "completed" | "failed") && receiver.try_recv().is_err() {
-            return Ok(UserCommand::Quit);
-        }
-
-        match receiver.recv().await {
-            Ok(event) => state.apply(&event),
-            Err(broadcast::error::RecvError::Lagged(skipped)) => state.push_log(format!("event stream lagged; skipped {skipped} events")),
-            Err(broadcast::error::RecvError::Closed) => return Ok(UserCommand::Quit),
-        }
-    }
+    }.await;
+    execute!(out, LeaveAlternateScreen)?;
+    terminal::disable_raw_mode()?;
+    result
 }
 
 #[allow(dead_code)]
