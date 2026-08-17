@@ -16,7 +16,7 @@ pub async fn install(request: &str) -> Result<()> {
     let client = Client::builder().user_agent("x11-code-runtime").build()?;
     let release = client.get(API).send().await?.error_for_status()?.json::<Release>().await?;
     let version = normalize_request(request)?;
-    let asset = select_asset(&release.assets, &version).context("no compatible managed Python asset for this platform")?;
+    let asset = select_asset(&release.assets, &version).context("no compatible managed Python asset for this platform/version")?;
     let expected = asset.digest.as_deref().and_then(|d| d.strip_prefix("sha256:")).context("Python release asset has no SHA-256 digest")?;
 
     let root = runtime_root().join("python").join(&version);
@@ -53,7 +53,6 @@ fn normalize_request(request: &str) -> Result<String> {
 }
 
 fn select_asset<'a>(assets: &'a [Asset], requested: &str) -> Option<&'a Asset> {
-    let major_minor = requested.split('.').take(2).collect::<Vec<_>>().join(".");
     let platform = match (env::consts::OS, env::consts::ARCH) {
         ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
         ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
@@ -63,11 +62,12 @@ fn select_asset<'a>(assets: &'a [Asset], requested: &str) -> Option<&'a Asset> {
         ("windows", "aarch64") => "aarch64-pc-windows-msvc",
         _ => return None,
     };
+    let exact = requested.split('.').count() >= 3;
     assets.iter().find(|a| {
-        a.name.starts_with(&format!("cpython-{major_minor}")) &&
-        a.name.contains(platform) &&
-        a.name.contains("install_only_stripped") &&
-        a.name.ends_with(".tar.gz")
+        if !a.name.contains(platform) || !a.name.contains("install_only_stripped") || !a.name.ends_with(".tar.gz") { return false; }
+        let prefix = a.name.strip_prefix("cpython-")?;
+        let actual = prefix.split('+').next()?;
+        if exact { actual == requested } else { actual.starts_with(&format!("{}.", requested)) }
     })
 }
 
@@ -112,4 +112,8 @@ mod tests {
     use super::*;
     #[test] fn version_rejects_non_numeric(){ assert!(normalize_request("latest").is_err()); }
     #[test] fn version_normalizes_v_prefix(){ assert_eq!(normalize_request("v3.13").unwrap(), "3.13"); }
+    #[test] fn exact_patch_does_not_match_other_patch(){
+        let a = Asset { name: "cpython-3.13.14+20260718-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz".into(), browser_download_url: String::new(), digest: Some("sha256:abc".into()) };
+        assert!(select_asset(&[a], "3.13.13").is_none());
+    }
 }
