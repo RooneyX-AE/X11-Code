@@ -7,6 +7,7 @@ pub mod plugin_runtime;
 pub mod swarm_adapter;
 pub mod swarm_reviewer;
 pub mod swarm_state;
+pub mod repair;
 
 use anyhow::{Context, Result};
 use std::{path::PathBuf, sync::Arc, time::Duration};
