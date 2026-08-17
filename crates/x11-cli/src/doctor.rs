@@ -1,5 +1,5 @@
 use std::{env, fs, path::{Path, PathBuf}, process::Command};
-use crate::{runtime, sandbox};
+use crate::runtime;
 
 #[derive(Debug, Clone)]
 pub struct Check {
@@ -18,10 +18,10 @@ pub fn collect() -> Vec<Check> {
         check_shell(),
         check_workspace(),
         check_model_env(),
-        check_sandbox(),
     ];
     let workspace = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     checks.push(check_project_environment(&workspace));
+    checks.push(check_sandbox());
     for status in runtime::inspect(&workspace) {
         let name = match status.kind { runtime::RuntimeKind::Node => "node-runtime", runtime::RuntimeKind::Python => "python-runtime" };
         let detail = match (&status.source, &status.executable, &status.version, &status.requested) {
@@ -51,17 +51,6 @@ fn check_command(name: &'static str, required: bool) -> Check {
         _ if required => Check { name, status: Status::Fail, detail: "missing".into() },
         _ => Check { name, status: Status::Warn, detail: "missing (optional)".into() },
     }
-}
-
-fn check_sandbox() -> Check {
-    let capability = sandbox::detect();
-    let detail = format!("backend={:?}; fs={}; net={}; proc={}; {}", capability.backend, capability.filesystem_isolation, capability.network_isolation, capability.process_isolation, capability.reason);
-    let status = match capability.backend {
-        sandbox::Backend::None => Status::Warn,
-        sandbox::Backend::WindowsRestrictedToken if !capability.network_isolation => Status::Warn,
-        _ => Status::Ok,
-    };
-    Check { name: "sandbox", status, detail }
 }
 
 fn check_project_environment(workspace: &Path) -> Check {
@@ -94,8 +83,45 @@ fn check_project_environment(workspace: &Path) -> Check {
         let detail = if python.is_file() { format!("Python .venv ready; source: {lock}") } else { format!("Python .venv missing; run `x11 project env python`; source: {lock}") };
         return Check { name: "project-env", status, detail };
     }
-    if cargo.is_file() { return Check { name: "project-env", status: Status::Ok, detail: "Rust Cargo project detected".into() }; }
+    if cargo.is_file() {
+        return Check { name: "project-env", status: Status::Ok, detail: "Rust Cargo project detected".into() };
+    }
     Check { name: "project-env", status: Status::Warn, detail: "no recognized project manifest".into() }
+}
+
+fn check_sandbox() -> Check {
+    if cfg!(target_os = "linux") {
+        let bwrap = Command::new("bwrap").arg("--version").output();
+        if !matches!(bwrap, Ok(ref output) if output.status.success()) {
+            return Check { name: "sandbox", status: Status::Warn, detail: "Bubblewrap unavailable; strict sandbox cannot run".into() };
+        }
+        let probe = Command::new("bwrap")
+            .args([
+                "--die-with-parent",
+                "--unshare-user",
+                "--unshare-pid",
+                "--unshare-net",
+                "--proc", "/proc",
+                "--dev", "/dev",
+                "--ro-bind", "/usr", "/usr",
+                "--ro-bind", "/bin", "/bin",
+                "/bin/true",
+            ])
+            .output();
+        return match probe {
+            Ok(output) if output.status.success() => Check { name: "sandbox", status: Status::Ok, detail: "Bubblewrap preflight passed (user/pid/network namespaces)".into() },
+            Ok(output) => Check { name: "sandbox", status: Status::Warn, detail: format!("Bubblewrap present but preflight failed: {}", String::from_utf8_lossy(&output.stderr).trim()) },
+            Err(error) => Check { name: "sandbox", status: Status::Warn, detail: format!("Bubblewrap preflight could not run: {error}") },
+        };
+    }
+    if cfg!(target_os = "macos") {
+        let available = Path::new("/usr/bin/sandbox-exec").is_file();
+        return Check { name: "sandbox", status: if available { Status::Ok } else { Status::Warn }, detail: if available { "macOS Seatbelt executable available".into() } else { "macOS sandbox backend unavailable".into() } };
+    }
+    if cfg!(target_os = "windows") {
+        return Check { name: "sandbox", status: Status::Warn, detail: "Windows process isolation backend is not fully implemented yet".into() };
+    }
+    Check { name: "sandbox", status: Status::Warn, detail: "no supported sandbox backend for this platform".into() }
 }
 
 fn check_shell() -> Check {
