@@ -12,6 +12,7 @@ tokio.workspace=true
 uuid.workspace=true
 x11-context={path="../x11-context"}
 x11-core={path="../x11-core"}
+x11-mcp={path="../x11-mcp"}
 x11-model={path="../x11-model"}
 x11-permissions={path="../x11-permissions"}
 x11-protocol={path="../x11-protocol"}
