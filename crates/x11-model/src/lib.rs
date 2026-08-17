@@ -4,8 +4,15 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Message { pub role:String, pub content:String }
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Message {
+    pub role: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall { pub id:String, pub name:String, pub arguments:serde_json::Value }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,4 +89,9 @@ impl ModelProvider for OpenAiCompatible {
 }
 
 #[cfg(test)]
-mod tests { use super::*; #[tokio::test] async fn mock_provider_is_deterministic(){let p=MockProvider;let r=p.complete(CompletionRequest{model:"m".into(),messages:vec![Message{role:"user".into(),content:"hello".into()}],tools:vec![],temperature:None,max_tokens:None}).await.unwrap();assert_eq!(r.text,"Mock provider received: hello");assert!(r.tool_calls.is_empty());} #[test] fn retry_policy_covers_transient_failures(){assert!(OpenAiCompatible::retryable(StatusCode::TOO_MANY_REQUESTS));assert!(OpenAiCompatible::retryable(StatusCode::BAD_GATEWAY));assert!(!OpenAiCompatible::retryable(StatusCode::BAD_REQUEST));}}
+mod tests {
+ use super::*;
+ #[tokio::test] async fn mock_provider_is_deterministic(){let p=MockProvider;let r=p.complete(CompletionRequest{model:"m".into(),messages:vec![Message{role:"user".into(),content:"hello".into(),..Default::default()}],tools:vec![],temperature:None,max_tokens:None}).await.unwrap();assert_eq!(r.text,"Mock provider received: hello");assert!(r.tool_calls.is_empty());}
+ #[test] fn tool_message_roundtrips(){let message=Message{role:"assistant".into(),content:String::new(),tool_calls:vec![ToolCall{id:"1".into(),name:"read_file".into(),arguments:serde_json::json!({"path":"a"})}],tool_call_id:None};let json=serde_json::to_string(&message).unwrap();let decoded:Message=serde_json::from_str(&json).unwrap();assert_eq!(decoded.tool_calls[0].id,"1");}
+ #[test] fn retry_policy_covers_transient_failures(){assert!(OpenAiCompatible::retryable(StatusCode::TOO_MANY_REQUESTS));assert!(OpenAiCompatible::retryable(StatusCode::BAD_GATEWAY));assert!(!OpenAiCompatible::retryable(StatusCode::BAD_REQUEST));}
+}
