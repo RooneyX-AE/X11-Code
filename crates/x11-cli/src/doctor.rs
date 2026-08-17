@@ -1,4 +1,4 @@
-use std::{env, path::{Path, PathBuf}, process::Command};
+use std::{env, fs, path::{Path, PathBuf}, process::Command};
 use crate::runtime;
 
 #[derive(Debug, Clone)]
@@ -20,6 +20,7 @@ pub fn collect() -> Vec<Check> {
         check_model_env(),
     ];
     let workspace = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    checks.push(check_project_environment(&workspace));
     for status in runtime::inspect(&workspace) {
         let name = match status.kind { runtime::RuntimeKind::Node => "node-runtime", runtime::RuntimeKind::Python => "python-runtime" };
         let detail = match (&status.source, &status.executable, &status.version, &status.requested) {
@@ -49,6 +50,42 @@ fn check_command(name: &'static str, required: bool) -> Check {
         _ if required => Check { name, status: Status::Fail, detail: "missing".into() },
         _ => Check { name, status: Status::Warn, detail: "missing (optional)".into() },
     }
+}
+
+fn check_project_environment(workspace: &Path) -> Check {
+    let package = workspace.join("package.json");
+    let pyproject = workspace.join("pyproject.toml");
+    let requirements = workspace.join("requirements.txt");
+    let cargo = workspace.join("Cargo.toml");
+    if package.is_file() {
+        let manager = fs::read_to_string(&package).ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|v| v.get("packageManager").and_then(|v| v.as_str()).map(str::to_owned))
+            .or_else(|| {
+                if workspace.join("pnpm-lock.yaml").is_file() { Some("pnpm (lockfile)".into()) }
+                else if workspace.join("yarn.lock").is_file() { Some("yarn (lockfile)".into()) }
+                else if workspace.join("package-lock.json").is_file() { Some("npm (lockfile)".into()) }
+                else { Some("npm (default)".into()) }
+            }).unwrap_or_else(|| "unknown".into());
+        let lock = if workspace.join("pnpm-lock.yaml").is_file() { "pnpm-lock.yaml" }
+            else if workspace.join("yarn.lock").is_file() { "yarn.lock" }
+            else if workspace.join("package-lock.json").is_file() { "package-lock.json" }
+            else { "no lockfile" };
+        let status = if lock == "no lockfile" { Status::Warn } else { Status::Ok };
+        return Check { name: "project-env", status, detail: format!("Node package manager: {manager}; lock: {lock}") };
+    }
+    if pyproject.is_file() || requirements.is_file() {
+        let venv = workspace.join(".venv");
+        let python = if cfg!(windows) { venv.join("Scripts/python.exe") } else { venv.join("bin/python") };
+        let lock = if workspace.join("uv.lock").is_file() { "uv.lock" } else if requirements.is_file() { "requirements.txt" } else { "no lockfile" };
+        let status = if python.is_file() { Status::Ok } else { Status::Warn };
+        let detail = if python.is_file() { format!("Python .venv ready; source: {lock}") } else { format!("Python .venv missing; run `x11 project env python`; source: {lock}") };
+        return Check { name: "project-env", status, detail };
+    }
+    if cargo.is_file() {
+        return Check { name: "project-env", status: Status::Ok, detail: "Rust Cargo project detected".into() };
+    }
+    Check { name: "project-env", status: Status::Warn, detail: "no recognized project manifest".into() }
 }
 
 fn check_shell() -> Check {
