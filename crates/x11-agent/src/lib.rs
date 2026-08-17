@@ -1,3 +1,5 @@
+pub mod manager;
+
 use anyhow::{Context, Result};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{process::Command, time::timeout};
@@ -49,11 +51,15 @@ pub struct AgentRuntime<P:ModelProvider>{
 }
 impl<P:ModelProvider> AgentRuntime<P>{
     pub fn new(goal:impl Into<String>,config:AgentConfig,provider:P)->Self{
+        Self::new_shared(goal, config, Arc::new(provider))
+    }
+
+    pub fn new_shared(goal:impl Into<String>,config:AgentConfig,provider:Arc<P>)->Self{
         let goal=goal.into();
         let mut orchestration=Orchestrator::default();
         orchestration.install_defaults();
         let verification=Self::verification_plan(&config);
-        Self{snapshot:AgentSnapshot::new(goal.clone(),config.max_iterations),session:Session::new(goal),provider:Arc::new(provider),tools:ToolRegistry::builtins(),policy:Policy::default(),context:MessageContext::default(),config,orchestration,verification}
+        Self{snapshot:AgentSnapshot::new(goal.clone(),config.max_iterations),session:Session::new(goal),provider,tools:ToolRegistry::builtins(),policy:Policy::default(),context:MessageContext::default(),config,orchestration,verification}
     }
 
     fn verification_plan(config:&AgentConfig)->VerificationPlan {
