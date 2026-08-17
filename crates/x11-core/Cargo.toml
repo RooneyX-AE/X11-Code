@@ -1,0 +1,10 @@
+[package]
+name = "x11-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+x11-protocol = { path = "../x11-protocol" }
