@@ -1,4 +1,5 @@
 pub mod orchestration;
+pub mod task_graph;
 pub mod verification;
 
 use serde::{Deserialize, Serialize};
