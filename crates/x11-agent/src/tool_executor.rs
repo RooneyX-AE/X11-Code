@@ -25,6 +25,7 @@ impl ToolExecutor {
     pub fn new(registry: ToolRegistry, workspace: PathBuf) -> Self { Self { registry, workspace, locks: WorkspaceLockManager::default(), default_allowed_tools: None } }
     pub fn with_locks(registry: ToolRegistry, workspace: PathBuf, locks: WorkspaceLockManager) -> Self { Self { registry, workspace, locks, default_allowed_tools: None } }
     pub fn with_locks_and_allowlist(registry: ToolRegistry, workspace: PathBuf, locks: WorkspaceLockManager, allowed: BTreeSet<String>) -> Self { Self { registry, workspace, locks, default_allowed_tools: Some(Arc::new(allowed)) } }
+    pub fn with_registry(&self, registry: ToolRegistry) -> Self { Self { registry, workspace: self.workspace.clone(), locks: self.locks.clone(), default_allowed_tools: self.default_allowed_tools.clone() } }
 
     fn allowed(name: &str, rules: Option<&BTreeSet<String>>) -> bool {
         let Some(rules) = rules else { return true; };
@@ -66,18 +67,12 @@ impl ToolExecutor {
                 Ok(Ok(output)) => return Ok(ToolExecutionResult { call_id:req.call_id, tool:req.name.clone(), success:true, output, duration:started.elapsed(), attempts:attempt, timed_out:false, cancelled:false }),
                 Ok(Err(error)) => {
                     last_error = error.to_string();
-                    if *cancel.borrow() {
-                        return Ok(ToolExecutionResult { call_id:req.call_id, tool:req.name.clone(), success:false, output:last_error, duration:started.elapsed(), attempts:attempt, timed_out:false, cancelled:true });
-                    }
-                    if attempt == attempts {
-                        return Ok(ToolExecutionResult { call_id:req.call_id, tool:req.name.clone(), success:false, output:last_error, duration:started.elapsed(), attempts:attempt, timed_out:false, cancelled:false });
-                    }
+                    if *cancel.borrow() { return Ok(ToolExecutionResult { call_id:req.call_id, tool:req.name.clone(), success:false, output:last_error, duration:started.elapsed(), attempts:attempt, timed_out:false, cancelled:true }); }
+                    if attempt == attempts { return Ok(ToolExecutionResult { call_id:req.call_id, tool:req.name.clone(), success:false, output:last_error, duration:started.elapsed(), attempts:attempt, timed_out:false, cancelled:false }); }
                 }
                 Err(_) => {
                     last_error = format!("tool timed out after {} ms", req.timeout.as_millis());
-                    if attempt == attempts {
-                        return Ok(ToolExecutionResult { call_id:req.call_id, tool:req.name.clone(), success:false, output:last_error, duration:started.elapsed(), attempts:attempt, timed_out:true, cancelled:false });
-                    }
+                    if attempt == attempts { return Ok(ToolExecutionResult { call_id:req.call_id, tool:req.name.clone(), success:false, output:last_error, duration:started.elapsed(), attempts:attempt, timed_out:true, cancelled:false }); }
                 }
             }
         }
@@ -93,52 +88,13 @@ mod tests {
     #[tokio::test] async fn allowlist_is_enforced_at_execution(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap());let(_tx,rx)=watch::channel(false);let mut allowed=BTreeSet::new();allowed.insert("read_file".into());assert!(ex.execute(req("git_status",json!({}),Some(allowed)),rx).await.is_err());}
     #[tokio::test] async fn executor_default_allowlist_is_hard_boundary(){let mut allowed=BTreeSet::new();allowed.insert("read_file".into());let ex=ToolExecutor{registry:ToolRegistry::builtins(),workspace:std::env::current_dir().unwrap(),locks:WorkspaceLockManager::default(),default_allowed_tools:Some(Arc::new(allowed))};let(_tx,rx)=watch::channel(false);assert!(ex.execute(req("git_status",json!({}),None),rx).await.is_err());}
     #[tokio::test] async fn wildcard_allowlist_works(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap());let(_tx,rx)=watch::channel(false);let mut allowed=BTreeSet::new();allowed.insert("git_*".into());let result=ex.execute(req("git_status",json!({}),Some(allowed)),rx).await.unwrap();assert!(result.success);}
-    #[tokio::test] async fn read_tool_executes(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap());let(_tx,rx)=watch::channel(false);let result=ex.execute(req("read_file",json!({"path":"Cargo.toml"}),None),rx).await.unwrap();assert!(result.success);}
+    #[tokio::test] async fn read_tool_executes(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap());let(_tx,rx)=watch::channel(false);let result=ex.execute(req("read_file",json!({"path":"Cargo.toml"}),rx).await.unwrap();assert!(result.success);}
 
     struct SlowTool;
     #[async_trait]
-    impl Tool for SlowTool {
-        fn name(&self)->&str{"slow_test"}
-        fn description(&self)->&str{"test-only slow tool"}
-        fn kind(&self)->ToolKind{ToolKind::ReadOnly}
-        fn input_schema(&self)->Value{json!({"type":"object","additionalProperties":false})}
-        async fn execute(&self,_:&ToolContext,_:Value)->Result<String>{sleep(Duration::from_millis(40)).await;Ok("done".into())}
-    }
-
-    fn slow_executor() -> ToolExecutor {
-        let mut registry = ToolRegistry::builtins();
-        registry.register(SlowTool);
-        ToolExecutor::new(registry, std::env::current_dir().unwrap())
-    }
-
-    #[tokio::test]
-    async fn timeout_retries_but_stays_bounded() {
-        let ex = slow_executor();
-        let (_tx, rx) = watch::channel(false);
-        let mut request = req("slow_test", json!({}), None);
-        request.timeout = Duration::from_millis(5);
-        request.max_attempts = 3;
-        let result = ex.execute(request, rx).await.unwrap();
-        assert!(!result.success);
-        assert!(result.timed_out);
-        assert!(!result.cancelled);
-        assert_eq!(result.attempts, 3);
-    }
-
-    #[tokio::test]
-    async fn cancellation_does_not_retry() {
-        let ex = slow_executor();
-        let (tx, rx) = watch::channel(false);
-        let mut request = req("slow_test", json!({}), None);
-        request.timeout = Duration::from_millis(500);
-        request.max_attempts = 3;
-        let task = tokio::spawn(async move { ex.execute(request, rx).await.unwrap() });
-        sleep(Duration::from_millis(5)).await;
-        tx.send(true).unwrap();
-        let result = task.await.unwrap();
-        assert!(!result.success);
-        assert!(result.cancelled);
-        assert_eq!(result.attempts, 0);
-        assert!(!result.timed_out);
-    }
+    impl Tool for SlowTool { fn name(&self)->&str{"slow_test"} fn description(&self)->&str{"test-only slow tool"} fn kind(&self)->ToolKind{ToolKind::ReadOnly} fn input_schema(&self)->Value{json!({"type":"object","additionalProperties":false})} async fn execute(&self,_:&ToolContext,_:Value)->Result<String>{sleep(Duration::from_millis(40)).await;Ok("done".into())} }
+    fn slow_executor() -> ToolExecutor { let mut registry=ToolRegistry::builtins(); registry.register(SlowTool); ToolExecutor::new(registry,std::env::current_dir().unwrap()) }
+    #[tokio::test] async fn timeout_retries_but_stays_bounded(){let ex=slow_executor();let(_tx,rx)=watch::channel(false);let mut request=req("slow_test",json!({}),None);request.timeout=Duration::from_millis(5);request.max_attempts=3;let result=ex.execute(request,rx).await.unwrap();assert!(!result.success);assert!(result.timed_out);assert!(!result.cancelled);assert_eq!(result.attempts,3);}
+    #[tokio::test] async fn cancellation_does_not_retry(){let ex=slow_executor();let(tx,rx)=watch::channel(false);let mut request=req("slow_test",json!({}),None);request.timeout=Duration::from_millis(500);request.max_attempts=3;let task=tokio::spawn(async move{ex.execute(request,rx).await.unwrap()});sleep(Duration::from_millis(5)).await;tx.send(true).unwrap();let result=task.await.unwrap();assert!(!result.success);assert!(result.cancelled);assert_eq!(result.attempts,0);assert!(!result.timed_out);}
+    #[tokio::test] async fn registry_replacement_preserves_allowlist(){let mut allowed=BTreeSet::new();allowed.insert("read_file".into());let base=ToolExecutor::with_locks_and_allowlist(ToolRegistry::builtins(),std::env::current_dir().unwrap(),WorkspaceLockManager::default(),allowed);let replaced=base.with_registry(ToolRegistry::builtins());let(_tx,rx)=watch::channel(false);assert!(replaced.execute(req("git_status",json!({}),None),rx).await.is_err());assert!(replaced.execute(req("read_file",json!({"path":"Cargo.toml"}),None),rx).await.unwrap().success);}
 }
