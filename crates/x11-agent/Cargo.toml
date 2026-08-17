@@ -1,0 +1,11 @@
+[package]
+name = "x11-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+x11-core = { path = "../x11-core" }
+x11-protocol = { path = "../x11-protocol" }
+x11-tools = { path = "../x11-tools" }
