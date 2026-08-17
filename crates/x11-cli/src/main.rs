@@ -1,5 +1,6 @@
 mod doctor;
-mod uninstall;
+mod runtime;
+mod runtime_cmd;
 mod update;
 
 use anyhow::Result;
@@ -21,9 +22,12 @@ enum Command {
     Run { goal:String, #[arg(short,long)] workspace:Option<PathBuf>, #[arg(long)] model:Option<String>, #[arg(long)] yes:bool, #[arg(long)] max_iterations:Option<u32>, #[arg(long)] session:Option<PathBuf>, #[arg(long="verify",value_name="COMMAND",action=clap::ArgAction::Append)] verify_commands:Vec<String>, #[arg(long)] hooks:bool, #[arg(long)] verification_timeout_ms:Option<u64>, #[arg(long,default_value="normal")] mode:String, #[arg(long)] tui:bool },
     Doctor { #[arg(long)] quiet: bool, #[arg(long)] json: bool },
     Update { #[arg(long)] check: bool },
-    Uninstall { #[arg(long)] purge_config: bool },
+    Runtime { #[command(subcommand)] command: RuntimeCommand },
     Sessions { #[command(subcommand)] command:SessionCommand },
 }
+
+#[derive(Debug, Subcommand)]
+enum RuntimeCommand { Status { #[arg(long)] json: bool } }
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand { List{#[arg(short,long)]workspace:Option<PathBuf>}, Show{id:Uuid,#[arg(short,long)]workspace:Option<PathBuf>}, Fork{id:Uuid,goal:String,#[arg(short,long)]workspace:Option<PathBuf>} }
@@ -59,10 +63,10 @@ async fn main()->Result<()>{
    } else if !doctor::print(true){std::process::exit(1);}
   },
   Some(Command::Update{check})=>{update::run(check).await?;},
-  Some(Command::Uninstall{purge_config})=>{uninstall::run(purge_config)?;},
+  Some(Command::Runtime{command})=>{match command{RuntimeCommand::Status{json}=>runtime_cmd::print_status(json)?;}},
   Some(Command::Run{goal,workspace,model,yes,max_iterations,session,verify_commands,hooks,verification_timeout_ms,mode,tui})=>{let mut cfg=AgentConfig::default();cfg.workspace=workspace.unwrap_or(std::env::current_dir()?);cfg.mode=parse_mode(&mode)?;if let Some(m)=model{cfg.model=m;}cfg.auto_approve=yes||matches!(cfg.mode,AgentMode::Auto);cfg.hooks_enabled=hooks;if let Some(n)=max_iterations{cfg.max_iterations=n.max(1);}if let Some(ms)=verification_timeout_ms{cfg.verification_timeout_ms=ms.clamp(100,600_000);}if !verify_commands.is_empty(){cfg.verification_commands=verify_commands;}cfg.session_path=session.or_else(||Some(Session::default_path(&cfg.workspace)));if let(Ok(key),Ok(base))=(std::env::var("X11_API_KEY"),std::env::var("X11_BASE_URL")){run_with_provider(goal,cfg,OpenAiCompatible::new(base,key),tui).await?;}else{run_with_provider(goal,cfg,MockProvider,tui).await?;}}
   Some(Command::Sessions{command})=>{let workspace=match &command{SessionCommand::List{workspace}|SessionCommand::Show{workspace,..}|SessionCommand::Fork{workspace,..}=>workspace.clone().unwrap_or(std::env::current_dir()?)};let store=store_for(workspace);match command{SessionCommand::List{..}=>{for(id,updated,goal)in store.list().await?{println!("{id}  {updated}  {goal}");}},SessionCommand::Show{id,..}=>{let s=store.load(id).await?;println!("{}\n{}\n{} events",s.id,s.goal,s.events.len());},SessionCommand::Fork{id,goal,..}=>{let s=store.load(id).await?;let fork=s.fork(goal);let path=store.save(&fork).await?;println!("forked {} -> {}\n{}",s.id,fork.id,path.display());}}}
-  None=>println!("X11 Code. Use `x11 doctor`, `x11 update`, `x11 uninstall`, `x11 run <goal> [--tui]`, or `x11 sessions list`.")
+  None=>println!("X11 Code. Use `x11 doctor`, `x11 update`, `x11 runtime status`, `x11 run <goal> [--tui]`, or `x11 sessions list`.")
  }
  Ok(())
 }
