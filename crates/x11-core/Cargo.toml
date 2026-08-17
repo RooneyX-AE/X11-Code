@@ -7,4 +7,5 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
+tokio.workspace = true
 x11-protocol = { path = "../x11-protocol" }
