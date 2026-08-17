@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::conflict_resolution::{ConflictHunk, ConflictResolutionGate, ResolutionProposal};
 use crate::conflict_resolver::{ConflictReport, MergeDecision};
 use crate::resolution_apply::{ApplyPreview, ResolutionApplier};
+use crate::resolution_transaction::{FileSnapshot, ResolutionTransaction};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolutionState { Proposed, Validated, Applied, Verified, RolledBack, Rejected }
@@ -31,6 +32,30 @@ impl ResolutionOrchestrator {
     pub async fn apply_once(workspace: &Path, hunk: &ConflictHunk, proposal: &ResolutionProposal) -> Result<ResolutionOutcome> {
         let path = ResolutionApplier::apply(workspace, hunk, proposal).await?;
         Ok(ResolutionOutcome { state: ResolutionState::Applied, attempts: 1, path: Some(path), reasons: Vec::new() })
+    }
+
+    pub async fn apply_and_verify<F, Fut>(workspace: &Path, hunk: &ConflictHunk, proposal: &ResolutionProposal, verify: F) -> Result<ResolutionOutcome>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<bool>>,
+    {
+        let snapshot: FileSnapshot = ResolutionTransaction::snapshot_file(workspace, Path::new(&hunk.path)).await?;
+        let path = ResolutionApplier::apply(workspace, hunk, proposal).await?;
+        match verify().await {
+            Ok(true) => Ok(ResolutionOutcome { state: ResolutionState::Verified, attempts: 1, path: Some(path), reasons: Vec::new() }),
+            Ok(false) => {
+                ResolutionTransaction::rollback(&snapshot).await?;
+                Ok(Self::rolled_back(1, vec!["verification failed; resolution rolled back".into()]))
+            }
+            Err(error) => {
+                ResolutionTransaction::rollback(&snapshot).await?;
+                Ok(Self::rolled_back(1, vec![format!("verification errored; resolution rolled back: {error}")]))
+            }
+        }
+    }
+
+    pub async fn verify_rollback_invariant(snapshot: &FileSnapshot) -> Result<bool> {
+        ResolutionTransaction::verify_unchanged(snapshot).await
     }
 
     pub fn reject(attempts: u32, reasons: Vec<String>) -> ResolutionOutcome {
