@@ -27,7 +27,7 @@ pub struct TuiState {
 }
 
 impl Default for TuiState {
-    fn default() -> Self { Self { state: "idle".into(), logs: VecDeque::new(), agents: Vec::new(), approval: None, todo: Vec::new(), cosmic: CosmicField::new(80, 24) } }
+    fn default() -> Self { Self { state: "idle".into(), logs: VecDeque::new(), agents: Vec::new(), approval: None, todo: Vec::new(), cosmic: CosmicField::new(120, 36) } }
 }
 
 impl TuiState {
@@ -57,8 +57,7 @@ impl TuiState {
 
 pub fn draw_snapshot<W: Write>(out: &mut W, state: &TuiState, width: u16, height: u16) -> anyhow::Result<()> {
     execute!(out, MoveTo(0, 0), Clear(ClearType::All))?;
-    let field = CosmicField::new(width, height);
-    let stars = field.overlay(width.min(120), height.min(36));
+    let stars = state.cosmic.overlay(width.min(120), height.min(36));
     for (y, row) in stars.lines().enumerate() { if y as u16 >= height { break; } execute!(out, MoveTo(0, y as u16), Print(row))?; }
     execute!(out, MoveTo(0, 0), SetAttribute(Attribute::Bold), Print(" ✦ X11 CODE"), SetAttribute(Attribute::Reset))?;
     let status = format!("state: {}", state.state);
