@@ -3,6 +3,36 @@ use std::{env, fs, path::{Path, PathBuf}, process::Stdio};
 use tokio::process::Command;
 use crate::runtime::{self, RuntimeKind, Source};
 
+pub fn python_path(workspace: &Path) -> PathBuf {
+    if cfg!(windows) { workspace.join(".venv/Scripts/python.exe") } else { workspace.join(".venv/bin/python") }
+}
+
+pub fn python_env_ready(workspace: &Path) -> bool {
+    python_path(workspace).is_file()
+}
+
+pub fn print_status(workspace: &Path, json: bool) -> Result<()> {
+    let workspace = workspace.canonicalize().context("resolve workspace")?;
+    let is_python = workspace.join("pyproject.toml").is_file() || workspace.join("requirements.txt").is_file();
+    let runtime = runtime::inspect(&workspace).into_iter().find(|s| s.kind == RuntimeKind::Python);
+    let payload = serde_json::json!({
+        "project": if is_python { "python" } else { "unknown" },
+        "venv": {"path": workspace.join(".venv").display().to_string(), "ready": python_env_ready(&workspace)},
+        "runtime": runtime.as_ref().map(|r| serde_json::json!({"source": match r.source { Source::System => "system", Source::Managed => "managed", Source::Missing => "missing" }, "version": r.version, "executable": r.executable.as_ref().map(|p| p.display().to_string())})),
+        "uv_lock": workspace.join("uv.lock").is_file(),
+        "requirements": workspace.join("requirements.txt").is_file(),
+    });
+    if json { println!("{}", serde_json::to_string_pretty(&payload)?); return Ok(()); }
+    println!("Python Environment");
+    println!("  project: {}", if is_python { "python" } else { "unknown" });
+    println!("  .venv:   {}", if python_env_ready(&workspace) { "ready" } else { "missing" });
+    println!("  path:    {}", workspace.join(".venv").display());
+    println!("  uv.lock: {}", workspace.join("uv.lock").is_file());
+    println!("  requirements.txt: {}", workspace.join("requirements.txt").is_file());
+    if let Some(r) = runtime { println!("  runtime: {:?} {:?}", r.source, r.version); }
+    Ok(())
+}
+
 pub async fn create_python(workspace: &Path) -> Result<()> {
     let workspace = workspace.canonicalize().context("resolve workspace")?;
     anyhow::ensure!(workspace.join("pyproject.toml").is_file() || workspace.join("requirements.txt").is_file(), "not a Python project: expected pyproject.toml or requirements.txt");
@@ -11,7 +41,7 @@ pub async fn create_python(workspace: &Path) -> Result<()> {
     let python = status.executable.context("resolved Python executable missing")?;
     let venv = workspace.join(".venv");
     if venv.exists() {
-        anyhow::ensure!(venv.join(if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" }).is_file(), "existing .venv is incomplete; remove it and retry");
+        anyhow::ensure!(python_path(&workspace).is_file(), "existing .venv is incomplete; remove it and retry");
         println!("Python environment already exists at {}", venv.display());
     } else {
         let mut cmd = Command::new(&python);
@@ -53,7 +83,7 @@ mod tests {
     #[test]
     fn incomplete_existing_venv_is_detectable() {
         let root = std::env::temp_dir().join(format!("x11-env-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
         assert!(!root.join(".venv").is_dir());
         fs::remove_dir_all(root).unwrap();
     }
