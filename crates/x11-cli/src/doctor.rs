@@ -1,4 +1,5 @@
-use std::{env, path::Path, process::Command};
+use std::{env, path::{Path, PathBuf}, process::Command};
+use crate::runtime;
 
 #[derive(Debug, Clone)]
 pub struct Check {
@@ -11,17 +12,28 @@ pub struct Check {
 pub enum Status { Ok, Warn, Fail }
 
 pub fn collect() -> Vec<Check> {
-    vec![
+    let mut checks = vec![
         check_command("git", true),
         check_command("rg", false),
-        check_command("python", false),
-        check_command("python3", false),
-        check_command("node", false),
-        check_command("npm", false),
         check_shell(),
         check_workspace(),
         check_model_env(),
-    ]
+    ];
+    let workspace = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    for status in runtime::inspect(&workspace) {
+        let name = match status.kind { runtime::RuntimeKind::Node => "node-runtime", runtime::RuntimeKind::Python => "python-runtime" };
+        let detail = match (&status.source, &status.executable, &status.version, &status.requested) {
+            (runtime::Source::System, Some(exe), Some(version), Some(req)) => format!("system {version} at {} (requested {req})", exe.display()),
+            (runtime::Source::System, Some(exe), Some(version), None) => format!("system {version} at {}", exe.display()),
+            (runtime::Source::Managed, Some(exe), Some(version), Some(req)) => format!("managed {version} at {} (requested {req})", exe.display()),
+            (runtime::Source::Managed, Some(exe), Some(version), None) => format!("managed {version} at {}", exe.display()),
+            (runtime::Source::Missing, _, _, Some(req)) => format!("missing (requested {req})"),
+            (runtime::Source::Missing, _, _, None) => "missing".into(),
+            _ => "unavailable".into(),
+        };
+        checks.push(Check { name, status: if matches!(status.source, runtime::Source::Missing) { Status::Warn } else { Status::Ok }, detail });
+    }
+    checks
 }
 
 fn check_command(name: &'static str, required: bool) -> Check {
@@ -66,7 +78,7 @@ pub fn print(quiet: bool) -> bool {
         println!("X11 Code Doctor\n");
         for check in &checks {
             let marker = match check.status { Status::Ok => '✓', Status::Warn => '!', Status::Fail => '✗' };
-            println!("{marker} {:<12} {}", check.name, check.detail);
+            println!("{marker} {:<14} {}", check.name, check.detail);
         }
         println!();
     }
