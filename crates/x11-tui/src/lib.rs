@@ -1,3 +1,5 @@
+pub mod cosmic;
+
 use crossterm::{
     cursor::MoveTo,
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -7,19 +9,25 @@ use crossterm::{
 };
 use std::{collections::VecDeque, io::{self, Write}, time::Duration};
 use x11_protocol::AgentEvent;
+use crate::cosmic::CosmicField;
 
 const MAX_LOG_LINES: usize = 500;
 
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest { pub tool: String, pub reason: String }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TuiState {
     pub state: String,
     pub logs: VecDeque<String>,
     pub agents: Vec<(String, String, String)>,
     pub approval: Option<ApprovalRequest>,
     pub todo: Vec<(String, String)>,
+    pub cosmic: CosmicField,
+}
+
+impl Default for TuiState {
+    fn default() -> Self { Self { state: "idle".into(), logs: VecDeque::new(), agents: Vec::new(), approval: None, todo: Vec::new(), cosmic: CosmicField::new(80, 24) } }
 }
 
 impl TuiState {
@@ -31,7 +39,7 @@ impl TuiState {
             AgentEvent::ToolRequested { tool, .. } => self.push_log(format!("tool → {tool}")),
             AgentEvent::ToolCompleted { tool, success, output, .. } => self.push_log(format!("{tool} {}: {output}", if *success { "✓" } else { "✗" })),
             AgentEvent::ApprovalRequested { tool, reason, .. } => { self.approval = Some(ApprovalRequest { tool: tool.clone(), reason: reason.clone() }); self.push_log(format!("approval required: {tool}")); }
-            AgentEvent::ApprovalResolved { tool, approved, .. } => { self.push_log(format!("approval {}: {}", if *approved { "granted" } else { "denied" }, tool)); if self.approval.as_ref().is_some_and(|a| a.tool == *tool) { self.approval = None; } }
+            AgentEvent::ApprovalResolved { tool, approved, .. } => { self.push_log(format!("approval {}: {tool}", if *approved { "granted" } else { "denied" })); if self.approval.as_ref().is_some_and(|a| a.tool == *tool) { self.approval = None; } }
             AgentEvent::SubagentStarted { agent_id, role, .. } => self.agents.push((agent_id.clone(), role.clone(), "running".into())),
             AgentEvent::SubagentFinished { agent_id, success, summary } => { if let Some(agent) = self.agents.iter_mut().find(|a| a.0 == *agent_id) { agent.2 = if *success { "done" } else { "failed" }.into(); } self.push_log(format!("subagent {agent_id}: {summary}")); }
             AgentEvent::TodoChanged { task_id, title, status } => { let key = task_id.to_string(); if let Some(item) = self.todo.iter_mut().find(|(id, _)| *id == key) { item.1 = format!("{title} [{status}]"); } else { self.todo.push((key, format!("{title} [{status}]"))); } }
@@ -41,13 +49,18 @@ impl TuiState {
             AgentEvent::SessionFinished { success } => self.state = if *success { "completed" } else { "failed" }.into(),
             AgentEvent::PlanCreated { steps } => self.push_log(format!("plan: {} steps", steps.len())),
         }
+        self.cosmic.tick();
     }
 
     fn push_log(&mut self, line: String) { for part in line.lines() { self.logs.push_back(part.to_owned()); } while self.logs.len() > MAX_LOG_LINES { self.logs.pop_front(); } }
 }
 
 pub fn draw_snapshot<W: Write>(out: &mut W, state: &TuiState, width: u16, height: u16) -> anyhow::Result<()> {
-    execute!(out, MoveTo(0, 0), Clear(ClearType::All), SetAttribute(Attribute::Bold), Print(" ✦ X11 CODE"), SetAttribute(Attribute::Reset))?;
+    execute!(out, MoveTo(0, 0), Clear(ClearType::All))?;
+    let field = CosmicField::new(width, height);
+    let stars = field.overlay(width.min(120), height.min(36));
+    for (y, row) in stars.lines().enumerate() { if y as u16 >= height { break; } execute!(out, MoveTo(0, y as u16), Print(row))?; }
+    execute!(out, MoveTo(0, 0), SetAttribute(Attribute::Bold), Print(" ✦ X11 CODE"), SetAttribute(Attribute::Reset))?;
     let status = format!("state: {}", state.state);
     execute!(out, MoveTo(width.saturating_sub(status.len() as u16 + 1), 0), Print(status))?;
     let sidebar = width.min(30);
