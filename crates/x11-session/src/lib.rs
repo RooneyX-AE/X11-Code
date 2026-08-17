@@ -1,4 +1,3 @@
-pub mod rollback;
 pub mod store;
 
 use anyhow::{Context, Result};
@@ -29,7 +28,7 @@ impl Session {
     pub fn load_json(input:&str)->Result<Self>{let session:Self=serde_json::from_str(input).context("invalid X11 session JSON")?;session.validate()?;Ok(session)}
     pub fn validate(&self)->Result<()> {if self.schema_version!=SESSION_SCHEMA_VERSION{anyhow::bail!("unsupported session schema version {}",self.schema_version)}if self.goal.trim().is_empty(){anyhow::bail!("session goal cannot be empty")}if let Some(integrity)=&self.integrity{let mut normalized=self.clone();normalized.integrity=None;let payload=serde_json::to_vec(&normalized)?;let expected=checksum(&payload);if integrity!=&expected{anyhow::bail!("session integrity check failed")}}for checkpoint in &self.checkpoints{if checkpoint.event_count>self.events.len(){anyhow::bail!("checkpoint {} references events beyond session history",checkpoint.id)}}Ok(())}
     pub fn refresh_integrity(&mut self){let mut normalized=self.clone();normalized.integrity=None;if let Ok(payload)=serde_json::to_vec(&normalized){self.integrity=Some(checksum(&payload));}}
-    pub async fn save_to(&self,path:impl AsRef<Path>)->Result<()> {let path=path.as_ref();if let Some(p)=path.parent(){fs::create_dir_all(p).await?;}let tmp=temporary_path(path);fs::write(&tmp,self.save_json()?).await?;if let Err(err)=fs::rename(&tmp,path).await{#[cfg(windows)]{if fs::try_exists(path).await.unwrap_or(false){fs::remove_file(path).await?;fs::rename(&tmp,path).await?;return Ok(());}}let _=fs::remove_file(&tmp).await;return Err(err.into())}Ok(())}
+    pub async fn save_to(&self,path:impl AsRef<Path>)->Result<()> {let path=path.as_ref();if let Some(p)=path.parent(){fs::create_dir_all(p).await?;}let tmp=temporary_path(path);fs::write(&tmp,self.save_json()?).await?;if let Err(err)=fs::rename(&tmp,path).await{#[cfg(windows)]{if fs::try_exists(path).await.unwrap_or(false){fs::remove_file(path).await?;fs::rename(&tmp,path).await?;return Ok(())}}let _=fs::remove_file(&tmp).await;return Err(err.into())}Ok(())}
     pub async fn load_from(path:impl AsRef<Path>)->Result<Self>{Self::load_json(&fs::read_to_string(path).await?)}
     pub fn default_path(workspace:impl AsRef<Path>)->PathBuf{workspace.as_ref().join(".x11/session.json")}
 }
