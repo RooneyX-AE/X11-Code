@@ -1,5 +1,5 @@
 use std::{env, fs, path::{Path, PathBuf}, process::Command};
-use crate::runtime;
+use crate::{runtime, sandbox};
 
 #[derive(Debug, Clone)]
 pub struct Check {
@@ -18,6 +18,7 @@ pub fn collect() -> Vec<Check> {
         check_shell(),
         check_workspace(),
         check_model_env(),
+        check_sandbox(),
     ];
     let workspace = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     checks.push(check_project_environment(&workspace));
@@ -52,6 +53,17 @@ fn check_command(name: &'static str, required: bool) -> Check {
     }
 }
 
+fn check_sandbox() -> Check {
+    let capability = sandbox::detect();
+    let detail = format!("backend={:?}; fs={}; net={}; proc={}; {}", capability.backend, capability.filesystem_isolation, capability.network_isolation, capability.process_isolation, capability.reason);
+    let status = match capability.backend {
+        sandbox::Backend::None => Status::Warn,
+        sandbox::Backend::WindowsRestrictedToken if !capability.network_isolation => Status::Warn,
+        _ => Status::Ok,
+    };
+    Check { name: "sandbox", status, detail }
+}
+
 fn check_project_environment(workspace: &Path) -> Check {
     let package = workspace.join("package.json");
     let pyproject = workspace.join("pyproject.toml");
@@ -82,9 +94,7 @@ fn check_project_environment(workspace: &Path) -> Check {
         let detail = if python.is_file() { format!("Python .venv ready; source: {lock}") } else { format!("Python .venv missing; run `x11 project env python`; source: {lock}") };
         return Check { name: "project-env", status, detail };
     }
-    if cargo.is_file() {
-        return Check { name: "project-env", status: Status::Ok, detail: "Rust Cargo project detected".into() };
-    }
+    if cargo.is_file() { return Check { name: "project-env", status: Status::Ok, detail: "Rust Cargo project detected".into() }; }
     Check { name: "project-env", status: Status::Warn, detail: "no recognized project manifest".into() }
 }
 
