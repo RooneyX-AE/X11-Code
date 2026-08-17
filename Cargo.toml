@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/x11-cli","crates/x11-core","crates/x11-agent","crates/x11-tools","crates/x11-context","crates/x11-model","crates/x11-session","crates/x11-permissions","crates/x11-protocol","crates/x11-mcp","crates/x11-tui"]
+members = ["crates/x11-cli","crates/x11-core","crates/x11-agent","crates/x11-tools","crates/x11-context","crates/x11-model","crates/x11-session","crates/x11-permissions","crates/x11-protocol","crates/x11-mcp","crates/x11-plugin","crates/x11-tui"]
 
 [workspace.package]
 version="0.1.0"
