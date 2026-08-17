@@ -19,16 +19,17 @@ pub struct ToolExecutionRequest {
 #[derive(Debug, Clone)]
 pub struct ToolExecutionResult { pub call_id: Uuid, pub tool: String, pub success: bool, pub output: String, pub duration: Duration, pub attempts: u32, pub timed_out: bool, pub cancelled: bool }
 #[derive(Clone)]
-pub struct ToolExecutor { registry: ToolRegistry, workspace: PathBuf, locks: WorkspaceLockManager }
+pub struct ToolExecutor { registry: ToolRegistry, workspace: PathBuf, locks: WorkspaceLockManager, default_allowed_tools: Option<Arc<BTreeSet<String>>> }
 
 impl ToolExecutor {
-    pub fn new(registry: ToolRegistry, workspace: PathBuf) -> Self { Self { registry, workspace, locks: WorkspaceLockManager::default() } }
-    pub fn with_locks(registry: ToolRegistry, workspace: PathBuf, locks: WorkspaceLockManager) -> Self { Self { registry, workspace, locks } }
+    pub fn new(registry: ToolRegistry, workspace: PathBuf) -> Self { Self { registry, workspace, locks: WorkspaceLockManager::default(), default_allowed_tools: None } }
+    pub fn with_locks(registry: ToolRegistry, workspace: PathBuf, locks: WorkspaceLockManager) -> Self { Self { registry, workspace, locks, default_allowed_tools: None } }
+    pub fn with_locks_and_allowlist(registry: ToolRegistry, workspace: PathBuf, locks: WorkspaceLockManager, allowed: BTreeSet<String>) -> Self { Self { registry, workspace, locks, default_allowed_tools: Some(Arc::new(allowed)) } }
 
     fn allowed(name: &str, rules: Option<&BTreeSet<String>>) -> bool {
         let Some(rules) = rules else { return true; };
         if rules.is_empty() { return false; }
-        rules.iter().any(|rule| rule == "*" || rule == name || (rule.ends_with("*") && name.starts_with(rule.trim_end_matches('*'))))
+        rules.iter().any(|rule| rule == "*" || rule == name || (rule.ends_with('*') && name.starts_with(rule.trim_end_matches('*'))))
     }
 
     fn lock_key(&self, req: &ToolExecutionRequest) -> Option<String> {
@@ -43,7 +44,8 @@ impl ToolExecutor {
 
     pub async fn execute(&self, req: ToolExecutionRequest, mut cancel: watch::Receiver<bool>) -> Result<ToolExecutionResult> {
         if self.registry.get(&req.name).is_none() { anyhow::bail!("unknown tool: {}", req.name); }
-        if !Self::allowed(&req.name, req.allowed_tools.as_ref()) { anyhow::bail!("tool '{}' is outside the agent allowlist", req.name); }
+        let configured = req.allowed_tools.as_ref().or(self.default_allowed_tools.as_deref());
+        if !Self::allowed(&req.name, configured) { anyhow::bail!("tool '{}' is outside the agent allowlist", req.name); }
         let _lock = match self.lock_key(&req) { Some(key) => Some(self.locks.acquire(key).await), None => None };
         let started = Instant::now();
         let attempts = req.max_attempts.clamp(1, 3);
@@ -76,7 +78,8 @@ mod tests {
     use super::*; use serde_json::json; use std::collections::BTreeSet;
     fn req(name:&str, args:Value, allowed:Option<BTreeSet<String>>) -> ToolExecutionRequest { ToolExecutionRequest{call_id:Uuid::new_v4(),name:name.into(),arguments:args,timeout:Duration::from_secs(2),max_attempts:1,allowed_tools:allowed,lock_key:None} }
     #[tokio::test] async fn unknown_tool_is_rejected(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap());let(_tx,rx)=watch::channel(false);assert!(ex.execute(req("missing",json!({}),None),rx).await.is_err());}
-    #[tokio::test] async fn allowlist_is_enforced_at_execution(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap());let(_tx,rx)=watch::channel(false);let mut allowed=BTreeSet::new();allowed.insert("read_file".into());let result=ex.execute(req("git_status",json!({}),Some(allowed)),rx).await;assert!(result.is_err());}
+    #[tokio::test] async fn allowlist_is_enforced_at_execution(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap());let(_tx,rx)=watch::channel(false);let mut allowed=BTreeSet::new();allowed.insert("read_file".into());assert!(ex.execute(req("git_status",json!({}),Some(allowed)),rx).await.is_err());}
+    #[tokio::test] async fn executor_default_allowlist_is_hard_boundary(){let mut allowed=BTreeSet::new();allowed.insert("read_file".into());let ex=ToolExecutor{registry:ToolRegistry::builtins(),workspace:std::env::current_dir().unwrap(),locks:WorkspaceLockManager::default(),default_allowed_tools:Some(Arc::new(allowed))};let(_tx,rx)=watch::channel(false);assert!(ex.execute(req("git_status",json!({}),None),rx).await.is_err());}
     #[tokio::test] async fn wildcard_allowlist_works(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap());let(_tx,rx)=watch::channel(false);let mut allowed=BTreeSet::new();allowed.insert("git_*".into());let result=ex.execute(req("git_status",json!({}),Some(allowed)),rx).await.unwrap();assert!(result.success);}
     #[tokio::test] async fn read_tool_executes(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap());let(_tx,rx)=watch::channel(false);let result=ex.execute(req("read_file",json!({"path":"Cargo.toml"}),None),rx).await.unwrap();assert!(result.success);}
 }
