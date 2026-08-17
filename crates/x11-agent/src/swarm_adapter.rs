@@ -73,10 +73,14 @@ mod tests {
     async fn adapter_inherits_parent_controls_and_emits_runtime_events() {
         let mut cfg=AgentConfig::default(); cfg.workspace=PathBuf::from(".");
         let parent=AgentRuntime::new("parent",cfg,MockProvider);
-        let mut rx = runtime_bus(parent.snapshot.session_id).subscribe();
+        let bus_before = runtime_bus(parent.snapshot.session_id);
+        let mut rx = bus_before.subscribe();
         let report=SwarmAdapter::run_with_parent(&parent,vec![spec()],AgentManagerConfig{max_concurrency:1,timeout_ms:5_000,..Default::default()}).await.unwrap();
         assert_eq!(report.results.len(),1); assert_eq!(report.succeeded,1); assert_eq!(SwarmAdapter::review(&report).verdict,crate::swarm_reviewer::ReviewVerdict::Accept); assert_ne!(report.swarm_id,Uuid::nil());
-        assert!(rx.try_recv().is_err(), "runtime bus must be cleaned after the swarm ends");
+        assert!(rx.try_recv().is_ok(), "existing subscribers retain the emitted swarm history");
+        let bus_after = runtime_bus(parent.snapshot.session_id);
+        assert!(!Arc::ptr_eq(&bus_before, &bus_after), "runtime bus must be released after the swarm ends");
+        remove_runtime_bus(parent.snapshot.session_id);
     }
 
     #[test]
