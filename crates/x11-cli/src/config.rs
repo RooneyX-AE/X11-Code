@@ -79,9 +79,6 @@ pub fn describe(workspace: &Path) -> Result<Vec<(String, String)>> {
     Ok(rows)
 }
 
-#[allow(dead_code)]
-fn _keep_variants_linked(_: Decision, _: Operation) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
