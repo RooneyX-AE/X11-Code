@@ -20,7 +20,7 @@ impl<P: ModelProvider + 'static> AgentRuntime<P> {
                 added += 1;
             }
         }
-        self.executor = crate::tool_executor::ToolExecutor::new(self.tools.clone(), self.config.workspace.clone());
+        self.executor = self.executor.with_registry(self.tools.clone());
         Ok(added)
     }
 }
