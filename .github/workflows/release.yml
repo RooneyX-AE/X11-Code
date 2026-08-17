@@ -12,6 +12,10 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -51,6 +55,11 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/x11.exe" dist/x11.exe
           Compress-Archive -Path dist/x11.exe -DestinationPath "x11-${{ matrix.target }}.zip" -Force
 
+      - name: Attest release artifact
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: x11-${{ matrix.target }}.*
+
       - name: Upload release candidate
         uses: actions/upload-artifact@v4
         with:
@@ -62,6 +71,10 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@v4
         with:
