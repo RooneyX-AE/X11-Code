@@ -2,6 +2,7 @@ pub mod commands;
 pub mod cosmic;
 pub mod stream;
 pub mod swarm;
+pub mod live_swarm;
 
 use crossterm::{cursor::MoveTo,event::{self, Event, KeyCode, KeyEvent, KeyModifiers},execute,style::{Attribute, Print, SetAttribute},terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen}};
 use std::{collections::VecDeque, io::{self, Write}, time::Duration};
