@@ -15,6 +15,7 @@ x11-core={path="../x11-core"}
 x11-mcp={path="../x11-mcp"}
 x11-model={path="../x11-model"}
 x11-permissions={path="../x11-permissions"}
+x11-plugin={path="../x11-plugin"}
 x11-protocol={path="../x11-protocol"}
 x11-session={path="../x11-session"}
 x11-tools={path="../x11-tools"}
