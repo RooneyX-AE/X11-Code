@@ -1,63 +1,18 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
-use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::Arc;
-use uuid::Uuid;
+use serde_json::{json, Value};
+use std::{collections::HashMap, path::{Component, Path, PathBuf}, sync::Arc, time::Duration};
+use tokio::{process::Command, time::timeout};
 
-#[derive(Debug, Clone)]
-pub struct ToolContext {
-    pub workspace: std::path::PathBuf,
-}
-
-#[async_trait]
-pub trait Tool: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn description(&self) -> &'static str;
-    async fn execute(&self, ctx: &ToolContext, input: Value) -> Result<String>;
-}
-
-#[derive(Default, Clone)]
-pub struct ToolRegistry {
-    tools: HashMap<String, Arc<dyn Tool>>,
-}
-
-impl ToolRegistry {
-    pub fn register<T: Tool + 'static>(&mut self, tool: T) {
-        self.tools.insert(tool.name().to_owned(), Arc::new(tool));
-    }
-
-    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.get(name).cloned()
-    }
-
-    pub fn names(&self) -> Vec<String> {
-        self.tools.keys().cloned().collect()
-    }
-
-    pub async fn execute(&self, ctx: &ToolContext, name: &str, input: Value) -> Result<String> {
-        let tool = self.tools.get(name).ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?;
-        let _call_id = Uuid::new_v4();
-        tool.execute(ctx, input).await
-    }
-}
-
-pub struct ReadFile;
-
-#[async_trait]
-impl Tool for ReadFile {
-    fn name(&self) -> &'static str { "read_file" }
-    fn description(&self) -> &'static str { "Read a UTF-8 file inside the workspace." }
-
-    async fn execute(&self, ctx: &ToolContext, input: Value) -> Result<String> {
-        let relative = input.get("path").and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("missing path"))?;
-        let path = ctx.workspace.join(relative);
-        let canonical_workspace = tokio::fs::canonicalize(&ctx.workspace).await?;
-        let canonical_path = tokio::fs::canonicalize(&path).await?;
-        if !canonical_path.starts_with(&canonical_workspace) {
-            anyhow::bail!("path escapes workspace");
-        }
-        Ok(tokio::fs::read_to_string(canonical_path).await?)
-    }
-}
+#[derive(Debug, Clone)] pub struct ToolContext { pub workspace:PathBuf }
+impl ToolContext { pub async fn path(&self,p:&str,write:bool)->Result<PathBuf>{let rel=Path::new(p);if rel.is_absolute()||rel.components().any(|c|matches!(c,Component::ParentDir)){anyhow::bail!("path escapes workspace")}let root=tokio::fs::canonicalize(&self.workspace).await?;let candidate=root.join(rel);if write{if let Some(parent)=candidate.parent(){let canon=tokio::fs::canonicalize(parent).await.unwrap_or_else(|_|parent.to_path_buf());if !canon.starts_with(&root){anyhow::bail!("path escapes workspace")}}Ok(candidate)}else{let canon=tokio::fs::canonicalize(candidate).await?;if !canon.starts_with(&root){anyhow::bail!("path escapes workspace")}Ok(canon)}} }
+#[derive(Debug,Clone,Copy,PartialEq,Eq)] pub enum ToolKind{ReadOnly,FilesystemWrite,Shell,GitWrite,Network}
+#[async_trait] pub trait Tool:Send+Sync{fn name(&self)->&'static str;fn description(&self)->&'static str;fn kind(&self)->ToolKind;fn input_schema(&self)->Value;async fn execute(&self,c:&ToolContext,input:Value)->Result<String>;}
+#[derive(Clone,Default)] pub struct ToolRegistry{tools:HashMap<String,Arc<dyn Tool>>}
+impl ToolRegistry{pub fn register<T:Tool+'static>(&mut self,t:T){self.tools.insert(t.name().to_owned(),Arc::new(t));}pub fn get(&self,n:&str)->Option<Arc<dyn Tool>>{self.tools.get(n).cloned()}pub fn definitions(&self)->Vec<Value>{let mut v=self.tools.values().map(|t|json!({"name":t.name(),"description":t.description(),"input_schema":t.input_schema()})).collect::<Vec<_>>();v.sort_by(|a,b|a["name"].as_str().cmp(&b["name"].as_str()));v}pub async fn execute(&self,c:&ToolContext,n:&str,i:Value)->Result<String>{self.get(n).context("unknown tool")?.execute(c,i).await}pub fn builtins()->Self{let mut r=Self::default();r.register(ReadFile);r.register(WriteFile);r.register(EditFile);r.register(Shell);r.register(Search);r.register(Git);r}}
+pub struct ReadFile;#[async_trait]impl Tool for ReadFile{fn name(&self)->&'static str{"read_file"}fn description(&self)->&'static str{"Read a UTF-8 file."}fn kind(&self)->ToolKind{ToolKind::ReadOnly}fn input_schema(&self)->Value{json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]})}async fn execute(&self,c:&ToolContext,i:Value)->Result<String>{let p=i["path"].as_str().context("path")?;Ok(tokio::fs::read_to_string(c.path(p,false).await?).await?)}}
+pub struct WriteFile;#[async_trait]impl Tool for WriteFile{fn name(&self)->&'static str{"write_file"}fn description(&self)->&'static str{"Write a UTF-8 file."}fn kind(&self)->ToolKind{ToolKind::FilesystemWrite}fn input_schema(&self)->Value{json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]})}async fn execute(&self,c:&ToolContext,i:Value)->Result<String>{let p=i["path"].as_str().context("path")?;let content=i["content"].as_str().context("content")?;let t=c.path(p,true).await?;if let Some(parent)=t.parent(){tokio::fs::create_dir_all(parent).await?;}tokio::fs::write(t,content).await?;Ok(format!("wrote {} bytes to {p}",content.len()))}}
+pub struct EditFile;#[async_trait]impl Tool for EditFile{fn name(&self)->&'static str{"edit_file"}fn description(&self)->&'static str{"Replace exactly one text occurrence."}fn kind(&self)->ToolKind{ToolKind::FilesystemWrite}fn input_schema(&self)->Value{json!({"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]})}async fn execute(&self,c:&ToolContext,i:Value)->Result<String>{let p=i["path"].as_str().context("path")?;let old=i["old"].as_str().context("old")?;let new=i["new"].as_str().context("new")?;let t=c.path(p,false).await?;let s=tokio::fs::read_to_string(&t).await?;let n=s.matches(old).count();if n!=1{anyhow::bail!("expected one match, found {n}")}tokio::fs::write(t,s.replacen(old,new,1)).await?;Ok(format!("edited {p}"))}}
+pub struct Shell;#[async_trait]impl Tool for Shell{fn name(&self)->&'static str{"shell"}fn description(&self)->&'static str{"Run a bounded shell command."}fn kind(&self)->ToolKind{ToolKind::Shell}fn input_schema(&self)->Value{json!({"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer"}},"required":["command"]})}async fn execute(&self,c:&ToolContext,i:Value)->Result<String>{let cmd=i["command"].as_str().context("command")?;let ms=i["timeout_ms"].as_u64().unwrap_or(30000).clamp(100,120000);let mut q=Command::new(if cfg!(windows){"cmd"}else{"sh"});q.args(if cfg!(windows){vec!["/C",cmd]}else{vec!["-lc",cmd]}).current_dir(&c.workspace);let o=timeout(Duration::from_millis(ms),q.output()).await.context("timeout")??;Ok(format!("exit={}\nstdout:\n{}\nstderr:\n{}",o.status.code().unwrap_or(-1),String::from_utf8_lossy(&o.stdout),String::from_utf8_lossy(&o.stderr)))}}
+pub struct Search;#[async_trait]impl Tool for Search{fn name(&self)->&'static str{"search"}fn description(&self)->&'static str{"Search recursively with ripgrep."}fn kind(&self)->ToolKind{ToolKind::ReadOnly}fn input_schema(&self)->Value{json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]})}async fn execute(&self,c:&ToolContext,i:Value)->Result<String>{let p=i["pattern"].as_str().context("pattern")?;let path=i["path"].as_str().unwrap_or(".");let t=c.path(path,false).await.unwrap_or_else(|_|c.workspace.clone());let o=Command::new("rg").args(["--line-number","--hidden","--glob","!.git/*",p,t.to_str().unwrap_or(".")]).current_dir(&c.workspace).output().await?;if o.status.success()||o.status.code()==Some(1){Ok(String::from_utf8_lossy(&o.stdout).into_owned())}else{anyhow::bail!("rg failed")}}}
+pub struct Git;#[async_trait]impl Tool for Git{fn name(&self)->&'static str{"git"}fn description(&self)->&'static str{"Run git with an explicit argument array."}fn kind(&self)->ToolKind{ToolKind::GitWrite}fn input_schema(&self)->Value{json!({"type":"object","properties":{"args":{"type":"array","items":{"type":"string"}}},"required":["args"]})}async fn execute(&self,c:&ToolContext,i:Value)->Result<String>{let a=i["args"].as_array().context("args")?.iter().map(|v|v.as_str().map(str::to_owned).context("git arg")).collect::<Result<Vec<_>>>()?;let o=Command::new("git").args(a).current_dir(&c.workspace).output().await?;Ok(format!("exit={}\nstdout:\n{}\nstderr:\n{}",o.status.code().unwrap_or(-1),String::from_utf8_lossy(&o.stdout),String::from_utf8_lossy(&o.stderr)))}}

@@ -1,8 +1,7 @@
 [package]
-name = "x11-permissions"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
+name="x11-permissions"
+version.workspace=true
+edition.workspace=true
+license.workspace=true
 [dependencies]
-serde.workspace = true
+serde.workspace=true
