@@ -1,6 +1,8 @@
 pub mod manager;
 pub mod project;
 pub mod tool_executor;
+pub mod mcp_tools;
+pub mod mcp_runtime;
 
 use anyhow::{Context, Result};
 use std::{path::PathBuf, sync::Arc, time::Duration};
