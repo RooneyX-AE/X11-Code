@@ -39,25 +39,31 @@ fn parse_mode(mode: &str) -> Result<AgentMode> {
 fn store_for(workspace: PathBuf) -> SessionStore { SessionStore::new(workspace.join(".x11/sessions")) }
 
 async fn run_with_provider<P: x11_model::ModelProvider + 'static>(goal: String, cfg: AgentConfig, provider: P, tui: bool) -> Result<()> {
-    let agent = AgentRuntime::new(goal, cfg, provider);
-    let receiver = agent.subscribe();
+    let mut agent = AgentRuntime::new(goal, cfg, provider);
     if tui {
+        let approval_requests = agent.enable_interactive_approvals();
+        let broker = agent.approvals.clone();
+        let events = agent.subscribe();
         let handle = tokio::spawn(async move {
             let mut agent = agent;
-            let result = agent.run().await;
-            (result, agent.session.events.len())
+            agent.run().await
         });
         let mut stdout = std::io::stdout();
-        let _ = run_stream(&mut stdout, receiver).await?;
-        handle.abort();
-        let _ = handle.await;
+        let user_command = run_stream(&mut stdout, events, broker, approval_requests).await?;
+        if matches!(user_command, x11_tui::stream::UserCommand::Quit) && !handle.is_finished() { handle.abort(); }
+        match handle.await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(err)) if matches!(user_command, x11_tui::stream::UserCommand::Quit) => { if err.to_string().contains("cancel") { Ok(()) } else { Err(err) } }
+            Ok(Err(err)) => Err(err),
+            Err(err) if err.is_cancelled() => Ok(()),
+            Err(err) => Err(err.into()),
+        }
     } else {
-        let mut agent = agent;
         let result = agent.run().await;
         for e in &agent.session.events { println!("{:?}", e); }
         result.map(|text| { if !text.is_empty() { println!("\n{text}"); } })?;
+        Ok(())
     }
-    Ok(())
 }
 
 #[tokio::main]
