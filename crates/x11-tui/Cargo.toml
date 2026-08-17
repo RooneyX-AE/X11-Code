@@ -11,4 +11,5 @@ serde_json.workspace = true
 uuid.workspace = true
 crossterm.workspace = true
 tokio.workspace = true
+x11-agent = { path = "../x11-agent" }
 x11-protocol = { path = "../x11-protocol" }
