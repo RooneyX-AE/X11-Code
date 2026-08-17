@@ -33,6 +33,7 @@ pub fn plan(workspace: &Path, kind: ProjectKind, action: &str) -> Result<Executi
 }
 
 enum NodeAction { Install, Test, Build }
+
 fn node_tool(workspace: &Path, action: NodeAction) -> Result<(PathBuf, Vec<String>, Option<RuntimeStatus>)> {
     let status = runtime_status(workspace, RuntimeKind::Node)?;
     anyhow::ensure!(status.source != Source::Missing, "Node.js runtime is missing; run `x11 runtime install node <version>`");
@@ -40,8 +41,8 @@ fn node_tool(workspace: &Path, action: NodeAction) -> Result<(PathBuf, Vec<Strin
     anyhow::ensure!(manager.state == node_manager::ResolveState::Ready,
         "package manager '{}' is not ready (requested: {}, detected: {})",
         manager.kind.name(), manager.requested.as_deref().unwrap_or("any"), manager.detected_version.as_deref().unwrap_or("missing"));
-    let program = manager.program.context("resolved package manager executable missing")?;
-    let args = match (manager.kind, action) {
+    let manager_program = manager.program.context("resolved package manager executable missing")?;
+    let base_args = match (manager.kind, action) {
         (node_manager::ManagerKind::Npm, NodeAction::Install)
             if workspace.join("package-lock.json").is_file() || workspace.join("npm-shrinkwrap.json").is_file() => vec!["ci"],
         (node_manager::ManagerKind::Npm, NodeAction::Install) => vec!["install"],
@@ -50,7 +51,26 @@ fn node_tool(workspace: &Path, action: NodeAction) -> Result<(PathBuf, Vec<Strin
         (_, NodeAction::Test) => vec!["test"],
         (_, NodeAction::Build) => vec!["run", "build"],
     };
-    Ok((program, args.into_iter().map(str::to_owned).collect(), Some(status)))
+    let (program, args) = wrap_project_local_yarn(&manager, manager_program, base_args, &status)?;
+    Ok((program, args, Some(status)))
+}
+
+fn wrap_project_local_yarn(
+    manager: &node_manager::ManagerResolution,
+    manager_program: PathBuf,
+    args: Vec<&str>,
+    node: &RuntimeStatus,
+) -> Result<(PathBuf, Vec<String>)> {
+    let is_cjs = manager.kind == node_manager::ManagerKind::Yarn
+        && manager_program.extension().and_then(|ext| ext.to_str()) == Some("cjs");
+    if !is_cjs {
+        return Ok((manager_program, args.into_iter().map(str::to_owned).collect()));
+    }
+    let node_program = node.executable.clone().context("managed Node executable missing for project-local Yarn")?;
+    let mut wrapped = Vec::with_capacity(args.len() + 1);
+    wrapped.push(manager_program.to_string_lossy().into_owned());
+    wrapped.extend(args.into_iter().map(str::to_owned));
+    Ok((node_program, wrapped))
 }
 
 enum PythonAction { Install, Test }
@@ -104,6 +124,37 @@ pub async fn execute(plan: &ExecutionPlan, timeout_ms: u64, dry_run: bool) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn detects_common_projects() { let root = std::env::temp_dir().join(format!("x11-exec-{}", std::process::id())); fs::create_dir_all(&root).unwrap(); fs::write(root.join("package.json"), "{}").unwrap(); assert_eq!(detect(&root), ProjectKind::Node); fs::remove_dir_all(root).unwrap(); }
-    #[test] fn unknown_project_is_rejected() { assert!(plan(Path::new("."), ProjectKind::Unknown, "test").is_err()); }
+
+    #[test]
+    fn detects_common_projects() {
+        let root = std::env::temp_dir().join(format!("x11-exec-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("package.json"), "{}").unwrap();
+        assert_eq!(detect(&root), ProjectKind::Node);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unknown_project_is_rejected() { assert!(plan(Path::new("."), ProjectKind::Unknown, "test").is_err()); }
+
+    #[test]
+    fn local_yarn_cjs_is_wrapped_by_node() {
+        let manager = node_manager::ManagerResolution {
+            kind: node_manager::ManagerKind::Yarn,
+            requested: Some("4.0.0".into()),
+            detected_version: Some("4.0.0".into()),
+            program: Some(PathBuf::from(".yarn/releases/yarn-4.0.0.cjs")),
+            state: node_manager::ResolveState::Ready,
+        };
+        let node = RuntimeStatus {
+            kind: RuntimeKind::Node,
+            source: Source::Managed,
+            executable: Some(PathBuf::from("/x11/node/bin/node")),
+            version: Some("24.0.0".into()),
+            requested: None,
+        };
+        let (program, args) = wrap_project_local_yarn(&manager, manager.program.clone().unwrap(), vec!["test"], &node).unwrap();
+        assert_eq!(program, PathBuf::from("/x11/node/bin/node"));
+        assert_eq!(args, vec![".yarn/releases/yarn-4.0.0.cjs", "test"]);
+    }
 }
