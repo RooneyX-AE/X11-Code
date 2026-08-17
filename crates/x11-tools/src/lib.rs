@@ -58,6 +58,13 @@ async fn atomic_replace(path: &Path, content: &str) -> Result<()> {
     let tmp = parent.join(format!(".x11-tmp-{}", uuid::Uuid::new_v4()));
     tokio::fs::write(&tmp, content).await?;
     if let Err(error) = tokio::fs::rename(&tmp, path).await {
+        #[cfg(windows)] {
+            if tokio::fs::try_exists(path).await.unwrap_or(false) {
+                tokio::fs::remove_file(path).await?;
+                tokio::fs::rename(&tmp, path).await?;
+                return Ok(());
+            }
+        }
         let _ = tokio::fs::remove_file(&tmp).await;
         return Err(error.into());
     }
@@ -130,19 +137,100 @@ pub struct Search;
 #[async_trait] impl Tool for Search {fn name(&self)->&str{"search"} fn description(&self)->&str{"Search text recursively, using ripgrep when available."} fn kind(&self)->ToolKind{ToolKind::ReadOnly} fn input_schema(&self)->Value{json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"],"additionalProperties":false})} async fn execute(&self,c:&ToolContext,i:Value)->Result<String>{let pattern=i["pattern"].as_str().context("pattern")?;if pattern.is_empty(){anyhow::bail!("pattern cannot be empty")}let path=i["path"].as_str().unwrap_or(".");let target=c.path(path,false).await?;let rg=Command::new("rg").args(["--line-number","--hidden","--glob","!.git/*",pattern,target.to_str().unwrap_or(".")]).current_dir(&c.workspace).output().await;if let Ok(o)=rg{if o.status.success()||o.status.code()==Some(1){return Ok(truncate(String::from_utf8_lossy(&o.stdout).into_owned()))}}let mut hits=Vec::new();let mut stack=vec![target];while let Some(dir)=stack.pop(){let mut rd=match tokio::fs::read_dir(&dir).await{Ok(v)=>v,Err(_)=>continue};while let Some(e)=rd.next_entry().await?{let p=e.path();if p.file_name().and_then(|s|s.to_str())==Some(".git"){continue}if e.file_type().await?.is_dir(){stack.push(p)}else if let Ok(text)=tokio::fs::read_to_string(&p).await{for(i,l)in text.lines().enumerate(){if l.contains(pattern){hits.push(format!("{}:{}:{}",p.strip_prefix(&c.workspace).unwrap_or(&p).display(),i+1,l));}}}}}Ok(truncate(hits.join("\n")))}}
 
 pub struct Git;
-#[async_trait] impl Tool for Git {fn name(&self)->&str{"git"} fn description(&self)->&str{"Run git with an explicit argument array."} fn kind(&self)->ToolKind{ToolKind::GitWrite} fn input_schema(&self)->Value{json!({"type":"object","properties":{"args":{"type":"array","items":{"type":"string"}}},"required":["args"],"additionalProperties":false})} async fn execute(&self,c:&ToolContext,i:Value)->Result<String>{let a=i["args"].as_array().context("args")?.iter().map(|v|v.as_str().map(str::to_owned).context("git arg must be string")).collect::<Result<Vec<_>>>()?;if a.len()>64{anyhow::bail!("too many git arguments")}let o=Command::new("git").args(a).current_dir(&c.workspace).output().await?;Ok(truncate(format!("exit={}\nstdout:\n{}\nstderr:\n{}",o.status.code().unwrap_or(-1),String::from_utf8_lossy(&o.stdout),String::from_utf8_lossy(&o.stderr))))}}
+#[async_trait] impl Tool for Git {fn name(&self)->&str{"git"}fn description(&self)->&str{"Run git with an explicit argument array."}fn kind(&self)->ToolKind{ToolKind::GitWrite}fn input_schema(&self)->Value{json!({"type":"object","properties":{"args":{"type":"array","items":{"type":"string"}}},"required":["args"],"additionalProperties":false})}async fn execute(&self,c:&ToolContext,i:Value)->Result<String>{let a=i["args"].as_array().context("args")?.iter().map(|v|v.as_str().map(str::to_owned).context("git arg must be string")).collect::<Result<Vec<_>>>()?;if a.len()>64{anyhow::bail!("too many git arguments")}let o=Command::new("git").args(a).current_dir(&c.workspace).output().await?;Ok(truncate(format!("exit={}\nstdout:\n{}\nstderr:\n{}",o.status.code().unwrap_or(-1),String::from_utf8_lossy(&o.stdout),String::from_utf8_lossy(&o.stderr))))}}
 
 pub struct GitStatus;
-#[async_trait] impl Tool for GitStatus {fn name(&self)->&str{"git_status"} fn description(&self)->&str{"Inspect repository status without modifying it."} fn kind(&self)->ToolKind{ToolKind::ReadOnly} fn input_schema(&self)->Value{json!({"type":"object","properties":{},"required":[],"additionalProperties":false})} async fn execute(&self,c:&ToolContext,_:Value)->Result<String>{let o=Command::new("git").args(["status","--short","--branch"]).current_dir(&c.workspace).output().await?;Ok(truncate(format!("exit={}\n{}",o.status.code().unwrap_or(-1),String::from_utf8_lossy(&o.stdout))))}}
+#[async_trait] impl Tool for GitStatus {fn name(&self)->&str{"git_status"}fn description(&self)->&str{"Inspect repository status without modifying it."}fn kind(&self)->ToolKind{ToolKind::ReadOnly}fn input_schema(&self)->Value{json!({"type":"object","properties":{},"required":[],"additionalProperties":false})}async fn execute(&self,c:&ToolContext,_:Value)->Result<String>{let o=Command::new("git").args(["status","--short","--branch"]).current_dir(&c.workspace).output().await?;Ok(truncate(format!("exit={}\n{}",o.status.code().unwrap_or(-1),String::from_utf8_lossy(&o.stdout))))}}
 
 pub struct GitDiff;
-#[async_trait] impl Tool for GitDiff {fn name(&self)->&str{"git_diff"} fn description(&self)->&str{"Inspect the current git diff without modifying the repository."} fn kind(&self)->ToolKind{ToolKind::ReadOnly} fn input_schema(&self)->Value{json!({"type":"object","properties":{"cached":{"type":"boolean"}},"required":[],"additionalProperties":false})} async fn execute(&self,c:&ToolContext,i:Value)->Result<String>{let cached=i["cached"].as_bool().unwrap_or(false);let mut q=Command::new("git");q.args(if cached{vec!["diff","--cached","--"]}else{vec!["diff","--"]}).current_dir(&c.workspace);let o=q.output().await?;Ok(truncate(String::from_utf8_lossy(&o.stdout).into_owned()))}}
+#[async_trait] impl Tool for GitDiff {fn name(&self)->&str{"git_diff"}fn description(&self)->&str{"Inspect the current git diff without modifying the repository."}fn kind(&self)->ToolKind{ToolKind::ReadOnly}fn input_schema(&self)->Value{json!({"type":"object","properties":{"cached":{"type":"boolean"}},"required":[],"additionalProperties":false})}async fn execute(&self,c:&ToolContext,i:Value)->Result<String>{let cached=i["cached"].as_bool().unwrap_or(false);let mut q=Command::new("git");q.args(if cached{vec!["diff","--cached","--"]}else{vec!["diff","--"]}).current_dir(&c.workspace);let o=q.output().await?;Ok(truncate(String::from_utf8_lossy(&o.stdout).into_owned()))}}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn registry_contains_core_tools(){let r=ToolRegistry::builtins();for n in ["read_file","write_file","edit_file","list_files","shell","search","git","git_status","git_diff"]{assert!(r.get(n).is_some());}}
-    #[tokio::test] async fn parent_path_is_rejected(){let c=ToolContext{workspace:std::env::current_dir().unwrap()};assert!(c.path("../Cargo.toml",false).await.is_err());}
-    #[tokio::test] async fn write_rejects_symlink_escape(){let root=std::env::temp_dir().join(format!("x11-tools-{}",uuid::Uuid::new_v4()));let outside=root.with_extension("outside");tokio::fs::create_dir_all(&root).await.unwrap();tokio::fs::write(&outside,"secret").await.unwrap();let link=root.join("link.txt");#[cfg(unix)] std::os::unix::fs::symlink(&outside,&link).unwrap();#[cfg(unix)] {let c=ToolContext{workspace:root.clone()};assert!(c.path("link.txt",true).await.is_err());}let _=tokio::fs::remove_dir_all(&root).await;let _=tokio::fs::remove_file(&outside).await;}
-    #[tokio::test] async fn write_limits_file_size(){let root=std::env::temp_dir().join(format!("x11-tools-{}",uuid::Uuid::new_v4()));tokio::fs::create_dir_all(&root).await.unwrap();let c=ToolContext{workspace:root.clone()};let result=WriteFile.execute(&c,json!({"path":"big.txt","content":"x".repeat(MAX_FILE_WRITE+1)})).await;assert!(result.is_err());let _=tokio::fs::remove_dir_all(root).await;}
+
+    async fn temp_workspace() -> PathBuf {
+        let root = std::env::temp_dir().join(format!("x11-tools-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        root
+    }
+
+    async fn cleanup(root: &Path) { let _ = tokio::fs::remove_dir_all(root).await; }
+
+    #[test]
+    fn registry_contains_core_tools() {
+        let r = ToolRegistry::builtins();
+        for n in ["read_file","write_file","edit_file","list_files","shell","search","git","git_status","git_diff"] { assert!(r.get(n).is_some()); }
+    }
+
+    #[tokio::test]
+    async fn parent_path_is_rejected() {
+        let c = ToolContext { workspace: std::env::current_dir().unwrap() };
+        assert!(c.path("../Cargo.toml", false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn write_rejects_symlink_escape() {
+        let root = temp_workspace().await;
+        let outside = root.with_extension("outside");
+        tokio::fs::write(&outside, "secret").await.unwrap();
+        #[cfg(unix)] {
+            let link = root.join("link.txt");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            let c = ToolContext { workspace: root.clone() };
+            assert!(c.path("link.txt", true).await.is_err());
+        }
+        cleanup(&root).await;
+        let _ = tokio::fs::remove_file(&outside).await;
+    }
+
+    #[tokio::test]
+    async fn write_limits_file_size() {
+        let root = temp_workspace().await;
+        let c = ToolContext { workspace: root.clone() };
+        let result = WriteFile.execute(&c, json!({"path":"big.txt","content":"x".repeat(MAX_FILE_WRITE+1)})).await;
+        assert!(result.is_err());
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn edit_requires_exactly_one_match() {
+        let root = temp_workspace().await;
+        let c = ToolContext { workspace: root.clone() };
+        WriteFile.execute(&c, json!({"path":"a.txt","content":"foo foo"})).await.unwrap();
+        assert!(EditFile.execute(&c, json!({"path":"a.txt","old":"foo","new":"bar"})).await.is_err());
+        let content = tokio::fs::read_to_string(root.join("a.txt")).await.unwrap();
+        assert_eq!(content, "foo foo");
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn write_replaces_existing_file() {
+        let root = temp_workspace().await;
+        let c = ToolContext { workspace: root.clone() };
+        WriteFile.execute(&c, json!({"path":"a.txt","content":"one"})).await.unwrap();
+        WriteFile.execute(&c, json!({"path":"a.txt","content":"two"})).await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(root.join("a.txt")).await.unwrap(), "two");
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn shell_timeout_is_enforced() {
+        let root = temp_workspace().await;
+        let c = ToolContext { workspace: root.clone() };
+        let command = if cfg!(windows) { "ping -n 3 127.0.0.1 > nul" } else { "sleep 2" };
+        let result = Shell.execute(&c, json!({"command":command,"timeout_ms":100})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn git_rejects_non_string_arguments() {
+        let root = temp_workspace().await;
+        let c = ToolContext { workspace: root.clone() };
+        let result = Git.execute(&c, json!({"args":["status",42]})).await;
+        assert!(result.is_err());
+        cleanup(&root).await;
+    }
 }
