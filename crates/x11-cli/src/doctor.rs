@@ -17,6 +17,7 @@ pub fn collect() -> Vec<Check> {
     ];
     let workspace = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     checks.push(check_project_environment(&workspace));
+    checks.push(check_mcp_config(&workspace));
     checks.push(check_sandbox());
     for status in runtime::inspect(&workspace) {
         let name = match status.kind { runtime::RuntimeKind::Node => "node-runtime", runtime::RuntimeKind::Python => "python-runtime" };
@@ -81,6 +82,46 @@ fn check_project_environment(workspace: &Path) -> Check {
     }
     if cargo.is_file() { return Check { name: "project-env", status: Status::Ok, detail: "Rust Cargo project detected".into() }; }
     Check { name: "project-env", status: Status::Warn, detail: "no recognized project manifest".into() }
+}
+
+fn config_candidates(workspace: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(root) = env::var_os("X11_MCP_CONFIG") { paths.push(PathBuf::from(root)); }
+    if let Some(root) = env::var_os("X11_CONFIG_HOME") { paths.push(PathBuf::from(root).join("mcp.json")); }
+    if cfg!(windows) {
+        if let Some(root) = env::var_os("APPDATA") { paths.push(PathBuf::from(root).join("x11-code").join("mcp.json")); }
+    } else if let Some(root) = env::var_os("HOME") {
+        paths.push(PathBuf::from(root).join(".config").join("x11-code").join("mcp.json"));
+    }
+    paths.push(workspace.join(".x11").join("mcp.json"));
+    paths
+}
+
+fn check_mcp_config(workspace: &Path) -> Check {
+    let mut seen = Vec::new();
+    for path in config_candidates(workspace) {
+        if !path.is_file() || !seen.iter().any(|p: &PathBuf| p == &path) { continue; }
+    }
+    let files = config_candidates(workspace).into_iter().filter(|p| p.is_file()).collect::<Vec<_>>();
+    if files.is_empty() {
+        return Check { name: "mcp-config", status: Status::Ok, detail: "no MCP configuration (optional)".into() };
+    }
+    let mut servers = 0usize;
+    for path in &files {
+        let text = match fs::read_to_string(path) {
+            Ok(v) => v,
+            Err(error) => return Check { name: "mcp-config", status: Status::Fail, detail: format!("{}: {error}", path.display()) },
+        };
+        let value: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(error) => return Check { name: "mcp-config", status: Status::Fail, detail: format!("invalid JSON at {}: {error}", path.display()) },
+        };
+        match value.get("mcpServers").and_then(|v| v.as_object()) {
+            Some(map) => servers += map.len(),
+            None => return Check { name: "mcp-config", status: Status::Fail, detail: format!("{}: `mcpServers` must be an object", path.display()) },
+        }
+    }
+    Check { name: "mcp-config", status: Status::Ok, detail: format!("{} config file(s), {servers} server definition(s); parse-only check", files.len()) }
 }
 
 fn check_sandbox() -> Check {
