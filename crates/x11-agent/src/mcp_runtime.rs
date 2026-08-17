@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::{path::Path, sync::Arc};
+use std::path::Path;
 use crate::{mcp_tools::connect_mcp_server, AgentRuntime};
 use x11_mcp::McpRegistry;
 use x11_model::ModelProvider;
@@ -20,8 +20,7 @@ impl<P: ModelProvider + 'static> AgentRuntime<P> {
                 added += 1;
             }
         }
-        // ToolRegistry is cloned by value, so refresh the executor after dynamic registration.
-        self.executor = crate::tool_executor::ToolExecutor::new(self.tools.clone(), Arc::clone(&self.config.workspace));
+        self.executor = crate::tool_executor::ToolExecutor::new(self.tools.clone(), self.config.workspace.clone());
         Ok(added)
     }
 }
