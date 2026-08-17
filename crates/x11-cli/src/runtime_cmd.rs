@@ -33,3 +33,11 @@ pub fn print_status(json: bool) -> Result<()> {
     }
     Ok(())
 }
+
+pub async fn install(runtime_name: &str, version: &str) -> Result<()> {
+    match runtime_name.to_ascii_lowercase().as_str() {
+        "node" | "nodejs" => { runtime::install_node(version).await?; Ok(()) }
+        "python" | "python3" => anyhow::bail!("managed Python installation is not implemented yet; use system Python or wait for the Python backend")
+        other => anyhow::bail!("unknown runtime '{other}'; supported runtime installers: node"),
+    }
+}
