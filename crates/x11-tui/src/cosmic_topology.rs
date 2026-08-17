@@ -15,6 +15,12 @@ fn glyph_for_state(state: &str, progress: u8) -> char {
     else { '○' }
 }
 
+fn short_label(value: &str, max: usize) -> String {
+    let mut out = value.chars().take(max).collect::<String>();
+    if value.chars().count() > max { out.push('…'); }
+    out
+}
+
 pub fn render_topology(topology: &CosmicTopology, width: u16, height: u16, frame: u64) -> String {
     if width == 0 || height == 0 { return String::new(); }
     let mut grid = vec![vec![' '; width as usize]; height as usize];
@@ -31,20 +37,13 @@ pub fn render_topology(topology: &CosmicTopology, width: u16, height: u16, frame
         if x < 0 || y < 0 || (x as u16) >= width || (y as u16) >= height { continue; }
         let glyph = glyph_for_state(&agent.state, agent.progress);
         grid[y as usize][x as usize] = glyph;
-
-        // Small progress arc beside the agent. It is deterministic and uses runtime progress.
-        if x + 1 < width as i32 && y >= 0 {
+        if x + 1 < width as i32 {
             grid[y as usize][(x + 1) as usize] = match agent.progress {
-                0..=24 => '·',
-                25..=49 => '∘',
-                50..=74 => '∙',
-                75..=99 => '•',
-                _ => '●',
+                0..=24 => '·', 25..=49 => '∘', 50..=74 => '∙', 75..=99 => '•', _ => '●',
             };
         }
     }
 
-    // Tasks orbit around their owning agent. Unknown owners use the center orbit.
     let tasks = topology.tasks.values().collect::<Vec<_>>();
     for (i, task) in tasks.iter().enumerate() {
         let angle = ((i as u64 * 71 + frame / 9) % 360) as f64;
@@ -54,9 +53,20 @@ pub fn render_topology(topology: &CosmicTopology, width: u16, height: u16, frame
         if x < 0 || y < 0 || (x as u16) >= width || (y as u16) >= height { continue; }
         let glyph = glyph_for_state(&task.state, task.progress);
         if grid[y as usize][x as usize] == ' ' { grid[y as usize][x as usize] = glyph; }
+        let progress_glyph = if task.progress >= 100 { '●' } else if task.progress >= 50 { '◐' } else { '○' };
+        if x + 1 < width as i32 && grid[y as usize][(x + 1) as usize] == ' ' {
+            grid[y as usize][(x + 1) as usize] = progress_glyph;
+        }
+        // Compact task label in the upper-left margin. Labels are derived from task IDs only.
+        if i < 6 {
+            let label = format!("{} {}", short_label(&task.id, 12), task.progress);
+            let row = 1 + i;
+            for (col, ch) in label.chars().enumerate() {
+                if col + 1 < width as usize && row < height as usize { grid[row][col] = ch; }
+            }
+        }
     }
 
-    // Conflict pulses expand/contract around the center.
     for (i, _) in topology.conflicts.iter().enumerate() {
         let pulse = ((frame / 2 + i as u64 * 3) % 12) as i32;
         let radius = pulse.saturating_sub(1);
@@ -64,13 +74,10 @@ pub fn render_topology(topology: &CosmicTopology, width: u16, height: u16, frame
             (cx + radius, cy), (cx - radius, cy),
             (cx, cy + radius / 2), (cx, cy - radius / 2),
         ] {
-            if x >= 0 && y >= 0 && (x as u16) < width && (y as u16) < height {
-                grid[y as usize][x as usize] = '✶';
-            }
+            if x >= 0 && y >= 0 && (x as u16) < width && (y as u16) < height { grid[y as usize][x as usize] = '✶'; }
         }
     }
 
-    // Resolver convergence is a visible inward-moving marker during resolver states.
     let resolving = tasks.iter().any(|t| {
         let s = t.state.to_ascii_lowercase();
         s.contains("resolve") || s.contains("resolver")
@@ -81,10 +88,20 @@ pub fn render_topology(topology: &CosmicTopology, width: u16, height: u16, frame
             (cx + radius, cy), (cx - radius, cy),
             (cx, cy + radius / 2), (cx, cy - radius / 2),
         ] {
-            if x >= 0 && y >= 0 && (x as u16) < width && (y as u16) < height {
-                grid[y as usize][x as usize] = '◈';
-            }
+            if x >= 0 && y >= 0 && (x as u16) < width && (y as u16) < height { grid[y as usize][x as usize] = '◈'; }
         }
+    }
+
+    // Recent runtime timeline is rendered as a compact strip at the bottom.
+    if height > 2 {
+        let timeline_y = height as usize - 2;
+        let mut timeline = String::from("│ ");
+        for entry in topology.timeline.iter().rev().take(5).rev() {
+            let marker = short_label(&entry.kind, 10);
+            if !timeline.ends_with("│ ") { timeline.push_str(" · "); }
+            timeline.push_str(&marker);
+        }
+        for (col, ch) in timeline.chars().take(width as usize).enumerate() { grid[timeline_y][col] = ch; }
     }
 
     let mut out = String::new();
@@ -127,6 +144,20 @@ mod tests {
         assert!(render_topology(&topology, 60, 20, 12).contains('✶'));
         topology.apply(&SwarmEvent::new(swarm, SwarmEventKind::ResolverStarted)
             .task("task").state("resolving"));
-        assert!(render_topology(&topology, 60, 20, 12).contains('◈'));
+        let rendered = render_topology(&topology, 60, 20, 12);
+        assert!(rendered.contains('◈'));
+        assert!(rendered.contains("task"));
+    }
+
+    #[test]
+    fn timeline_is_visible_and_bounded_by_viewport() {
+        let swarm = Uuid::new_v4();
+        let mut topology = CosmicTopology::default();
+        for _ in 0..20 {
+            topology.apply(&SwarmEvent::new(swarm, SwarmEventKind::TaskQueued).task("task"));
+        }
+        let rendered = render_topology(&topology, 40, 10, 5);
+        assert_eq!(rendered.lines().count(), 10);
+        assert!(rendered.contains("TaskQueued"));
     }
 }
