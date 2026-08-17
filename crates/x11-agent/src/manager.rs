@@ -3,12 +3,20 @@ use std::{collections::{BTreeMap, BTreeSet}, path::PathBuf, sync::Arc};
 use tokio::{sync::Semaphore, task::JoinSet, time::{timeout, Duration}};
 use x11_core::{SubagentRole, SubagentSpec};
 use x11_model::ModelProvider;
+use x11_protocol::AgentEvent;
 
 use crate::{workspace_lock::WorkspaceLockManager, AgentConfig, AgentRuntime};
 use crate::tool_executor::ToolExecutor;
 
 #[derive(Debug, Clone)]
 pub struct SubagentResult { pub id:String, pub role:SubagentRole, pub success:bool, pub output:String, pub session_id:uuid::Uuid, pub iterations:u32, pub files_changed:Vec<String>, pub verification:String }
+
+#[derive(Debug, Clone)]
+pub struct SwarmReport { pub results:Vec<SubagentResult>, pub succeeded:usize, pub failed:usize, pub conflict_candidates:Vec<String> }
+impl SwarmReport {
+    pub fn all_success(&self) -> bool { self.failed == 0 }
+    pub fn summary(&self) -> String { format!("swarm complete: {} succeeded, {} failed, {} conflict candidate(s)", self.succeeded, self.failed, self.conflict_candidates.len()) }
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentManagerConfig { pub max_concurrency:usize, pub timeout_ms:u64 }
@@ -32,22 +40,18 @@ impl<P:ModelProvider+'static> AgentManager<P>{
     let mut runtime=AgentRuntime::new_shared(goal,cfg,provider);let session_id=runtime.snapshot.session_id;
     runtime.executor=if spec.allowed_tools.is_empty(){ToolExecutor::with_locks(runtime.tools.clone(),runtime.config.workspace.clone(),locks)}else{ToolExecutor::with_locks_and_allowlist(runtime.tools.clone(),runtime.config.workspace.clone(),locks,spec.allowed_tools.clone())};
     let result=timeout(Duration::from_millis(timeout_ms.max(1)),runtime.run()).await;
-    match result{Ok(Ok(output))=>Ok(SubagentResult{id:spec.id,role:spec.role,success:true,output,session_id,iterations:runtime.snapshot.iteration,files_changed:Vec::new(),verification:"runtime verification passed".into()}),Ok(Err(err))=>Ok(SubagentResult{id:spec.id,role:spec.role,success:false,output:err.to_string(),session_id,iterations:runtime.snapshot.iteration,files_changed:Vec::new(),verification:"runtime verification failed".into()}),Err(_)=>Ok(SubagentResult{id:spec.id,role:spec.role,success:false,output:format!("subagent timed out after {} ms",timeout_ms),session_id,iterations:runtime.snapshot.iteration,files_changed:Vec::new(),verification:"timed out".into()})}
+    let files_changed=runtime.session.events.iter().filter_map(|event|match event{AgentEvent::ToolRequested{tool,input,..} if tool=="write_file"||tool=="edit_file"=>input["path"].as_str().map(str::to_owned),_=>None}).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+    match result{Ok(Ok(output))=>Ok(SubagentResult{id:spec.id,role:spec.role,success:true,output,session_id,iterations:runtime.snapshot.iteration,files_changed,verification:"runtime verification passed".into()}),Ok(Err(err))=>Ok(SubagentResult{id:spec.id,role:spec.role,success:false,output:err.to_string(),session_id,iterations:runtime.snapshot.iteration,files_changed,verification:"runtime verification failed".into()}),Err(_)=>Ok(SubagentResult{id:spec.id,role:spec.role,success:false,output:format!("subagent timed out after {} ms",timeout_ms),session_id,iterations:runtime.snapshot.iteration,files_changed,verification:"timed out".into()})}
    });
   }
   let mut results=Vec::with_capacity(total);while let Some(joined)=jobs.join_next().await{results.push(joined.map_err(|e|anyhow!("subagent task join failure: {e}"))??);}results.sort_by(|a,b|a.id.cmp(&b.id));Ok(results)
  }
 
- pub async fn run_parallel(&self,specs:Vec<SubagentSpec>)->Result<Vec<SubagentResult>>{
+ pub async fn run_parallel(&self,specs:Vec<SubagentSpec>)->Result<Vec<SubagentResult>>{Ok(self.run_report(specs).await?.results)}
+ pub async fn run_report(&self,specs:Vec<SubagentSpec>)->Result<SwarmReport>{
   let mut pending: BTreeMap<String,SubagentSpec>=specs.into_iter().map(|s|(s.id.clone(),s)).collect();let mut completed=BTreeSet::new();let mut results=Vec::new();
-  while !pending.is_empty(){
-   let mut ready=pending.values().filter(|s|s.dependencies.iter().all(|d|completed.contains(d))).cloned().collect::<Vec<_>>();
-   if ready.is_empty(){let unresolved=pending.keys().cloned().collect::<Vec<_>>().join(", ");anyhow::bail!("subagent dependency cycle or missing dependency among: {unresolved}");}
-   ready.sort_by(|a,b|b.priority.cmp(&a.priority).then_with(||a.id.cmp(&b.id)));
-   let batch=self.run_batch(ready.clone()).await?;
-   for result in &batch{completed.insert(result.id.clone());pending.remove(&result.id);}results.extend(batch);
-  }
-  results.sort_by(|a,b|a.id.cmp(&b.id));Ok(results)
+  while !pending.is_empty(){let mut ready=pending.values().filter(|s|s.dependencies.iter().all(|d|completed.contains(d))).cloned().collect::<Vec<_>>();if ready.is_empty(){let unresolved=pending.keys().cloned().collect::<Vec<_>>().join(", ");anyhow::bail!("subagent dependency cycle or missing dependency among: {unresolved}");}ready.sort_by(|a,b|b.priority.cmp(&a.priority).then_with(||a.id.cmp(&b.id)));let batch=self.run_batch(ready).await?;for result in &batch{completed.insert(result.id.clone());pending.remove(&result.id);}results.extend(batch);}
+  results.sort_by(|a,b|a.id.cmp(&b.id));let succeeded=results.iter().filter(|r|r.success).count();let failed=results.len()-succeeded;let mut paths:BTreeMap<String,Vec<String>>=BTreeMap::new();for result in &results{for path in &result.files_changed{paths.entry(path.clone()).or_default().push(result.id.clone());}}let conflict_candidates=paths.into_iter().filter_map(|(path,owners)|if owners.len()>1{Some(format!("{path} <- {}",owners.join(", ")))}else{None}).collect();Ok(SwarmReport{results,succeeded,failed,conflict_candidates})
  }
 }
 
@@ -55,6 +59,6 @@ impl<P:ModelProvider+'static> AgentManager<P>{
 mod tests{use super::*;use x11_model::MockProvider;
  fn spec(id:&str,role:SubagentRole,priority:i32,deps:&[&str])->SubagentSpec{SubagentSpec{id:id.into(),role,goal:id.into(),max_iterations:1,model:"default".into(),token_budget:4_000,tool_budget:8,allowed_tools:BTreeSet::new(),dependencies:deps.iter().map(|d|d.to_string()).collect(),priority,workspace_scope:None}}
  #[tokio::test] async fn manager_runs_isolated_agents_in_parallel(){let manager=AgentManager::new(Arc::new(MockProvider),PathBuf::from("."),AgentConfig::default(),AgentManagerConfig{max_concurrency:2,timeout_ms:5_000});let results=manager.run_parallel(vec![spec("b",SubagentRole::Explorer,0,&[]),spec("a",SubagentRole::Tester,0,&[])]).await.unwrap();assert_eq!(results.len(),2);assert_eq!(results[0].id,"a");assert_eq!(results[1].id,"b");assert!(results.iter().all(|r|r.success));assert_ne!(results[0].session_id,results[1].session_id);}
- #[tokio::test] async fn dependencies_are_scheduled_in_batches(){let manager=AgentManager::new(Arc::new(MockProvider),PathBuf::from("."),AgentConfig::default(),AgentManagerConfig{max_concurrency:2,timeout_ms:5_000});let results=manager.run_parallel(vec![spec("review",SubagentRole::Reviewer,0,&["impl"]),spec("impl",SubagentRole::Implementer,1,&[])]).await.unwrap();assert_eq!(results.len(),2);}
+ #[tokio::test] async fn dependencies_are_scheduled_in_batches(){let manager=AgentManager::new(Arc::new(MockProvider),PathBuf::from("."),AgentConfig::default(),AgentManagerConfig{max_concurrency:2,timeout_ms:5_000});let report=manager.run_report(vec![spec("review",SubagentRole::Reviewer,0,&["impl"]),spec("impl",SubagentRole::Implementer,1,&[])]).await.unwrap();assert_eq!(report.results.len(),2);assert_eq!(report.failed,0);}
  #[tokio::test] async fn missing_dependency_is_rejected(){let manager=AgentManager::new(Arc::new(MockProvider),PathBuf::from("."),AgentConfig::default(),AgentManagerConfig::default());let err=manager.run_parallel(vec![spec("a",SubagentRole::Explorer,0,&["missing"])]).await.unwrap_err();assert!(err.to_string().contains("dependency"));}
 }
