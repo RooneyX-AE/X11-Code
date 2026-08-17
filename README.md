@@ -1,18 +1,33 @@
 # X11 Code
 
-X11 Code is an open-source autonomous coding agent designed for serious repository work.
+X11 Code is an open-source autonomous coding agent built as a Rust workspace. It combines a guarded tool runtime, model-provider abstraction, durable sessions, context management, permissions, MCP integration, and a stream-oriented protocol for future TUI/GUI clients.
 
-The project aims to provide a complete agentic coding workflow: model reasoning, repository context, filesystem and shell tools, Git operations, planning, verification, sessions, permissions, MCP, subagents, and an eventual cosmic animated interface.
+## Quick start
 
-## Principles
+```bash
+cargo run -p x11-cli -- run "inspect this repository and explain the next fixes"
+```
 
-- Agent first, UI second.
-- Verify changes instead of trusting model output.
-- Explicit permissions around side effects.
-- Provider-agnostic model layer.
-- Persistent sessions and recoverable work.
-- Fast CLI/TUI with optional cosmic visual effects.
+For an OpenAI-compatible API:
+
+```bash
+export X11_API_KEY=...
+export X11_BASE_URL=https://api.example.com/v1
+cargo run -p x11-cli -- run "fix the failing tests" --yes
+```
+
+The `--yes` switch auto-approves side-effecting tools. Without it, side-effecting operations are denied until an interactive approval layer is connected.
+
+## Design goals
+
+- deterministic safety boundary around filesystem, shell, Git and network operations
+- model-provider independence
+- bounded agent iterations and context compaction
+- durable, inspectable sessions
+- native MCP stdio client
+- small, testable Rust crates
+- presentation separated from correctness so the future cosmic UI cannot interfere with execution
 
 ## License
 
-MIT.
+MIT

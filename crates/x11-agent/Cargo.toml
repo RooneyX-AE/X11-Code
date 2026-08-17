@@ -1,11 +1,17 @@
 [package]
-name = "x11-agent"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+name="x11-agent"
+version.workspace=true
+edition.workspace=true
+license.workspace=true
 
 [dependencies]
-anyhow.workspace = true
-x11-core = { path = "../x11-core" }
-x11-protocol = { path = "../x11-protocol" }
-x11-tools = { path = "../x11-tools" }
+anyhow.workspace=true
+serde_json.workspace=true
+uuid.workspace=true
+x11-context={path="../x11-context"}
+x11-core={path="../x11-core"}
+x11-model={path="../x11-model"}
+x11-permissions={path="../x11-permissions"}
+x11-protocol={path="../x11-protocol"}
+x11-session={path="../x11-session"}
+x11-tools={path="../x11-tools"}
