@@ -62,19 +62,20 @@ impl ResolutionApplier {
 mod tests {
     use super::*;
     use crate::conflict_resolver::{ConflictReport, MergeDecision};
-    use tempfile::tempdir;
 
     #[tokio::test]
     async fn applies_only_inside_workspace() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("x.rs");
+        let dir = std::env::temp_dir().join(format!("x11-resolution-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("x.rs");
         tokio::fs::write(&path, "a\nb\nc\n").await.unwrap();
         let report = ConflictReport { decision: MergeDecision::ResolveRequired, overlapping_files: vec!["x.rs".into()], groups: vec![vec!["a".into(), "b".into()]] };
         let hunk = ConflictHunk { path: "x.rs".into(), start_line: 2, end_line: 2, agent_ids: vec!["a".into(), "b".into()], before: "b".into(), alternatives: vec!["B".into()] };
         let proposal = ResolutionProposal { path: "x.rs".into(), start_line: 2, end_line: 2, source_agents: vec!["a".into(), "b".into()], replacement: "B".into(), rationale: "merge".into() };
-        let result = ResolutionApplier::apply(dir.path(), &hunk, &proposal).await.unwrap();
+        let result = ResolutionApplier::apply(&dir, &hunk, &proposal).await.unwrap();
         assert_eq!(result, path);
-        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "a\nB\nc\n");
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "a\nB\nc\n");
+        let _ = tokio::fs::remove_dir_all(dir).await;
         let _ = report;
     }
 }
