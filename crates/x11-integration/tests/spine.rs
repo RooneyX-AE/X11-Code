@@ -1,13 +1,50 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::fs;
 use uuid::Uuid;
+use anyhow::Result;
+use async_trait::async_trait;
 use x11_agent::{AgentConfig, AgentRuntime};
 use x11_context::Context;
-use x11_model::{CompletionRequest, Message, MockProvider, ModelProvider};
+use x11_model::{CompletionRequest, CompletionResponse, Message, MockProvider, ModelProvider};
 use x11_permissions::{Decision, Operation, Policy};
 use x11_protocol::{stream::EventBus, AgentEvent};
 use x11_session::Session;
 use x11_tools::{ToolContext, ToolRegistry};
+
+struct EmptyProvider;
+
+#[async_trait]
+impl ModelProvider for EmptyProvider {
+    fn name(&self) -> &'static str { "empty" }
+    async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+        Ok(CompletionResponse {
+            text: String::new(),
+            tool_calls: Vec::new(),
+            finish_reason: Some("stop".into()),
+            usage: Default::default(),
+        })
+    }
+}
+
+struct CountingProvider {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ModelProvider for CountingProvider {
+    fn name(&self) -> &'static str { "counting" }
+    async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(CompletionResponse {
+            text: request.messages.last().map(|m| m.content.clone()).unwrap_or_default(),
+            tool_calls: Vec::new(),
+            finish_reason: Some("stop".into()),
+            usage: Default::default(),
+        })
+    }
+}
 
 #[tokio::test]
 async fn full_spine_smoke_test() {
@@ -93,4 +130,99 @@ async fn agent_cancellation_is_terminal() {
     assert!(agent.is_cancelled());
     assert!(agent.snapshot.state.is_terminal());
     let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn empty_model_response_fails_loudly() {
+    let root = std::env::temp_dir().join(format!("x11-integration-empty-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).await.unwrap();
+    let config = AgentConfig {
+        workspace: root.clone(),
+        model: "empty".into(),
+        verification_commands: Vec::new(),
+        ..AgentConfig::default()
+    };
+    let mut agent = AgentRuntime::new("must fail", config, EmptyProvider);
+    let result = agent.run().await;
+    assert!(result.is_err());
+    assert_eq!(agent.snapshot.state, x11_core::AgentState::Failed);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn session_tampering_is_rejected_after_persistence() {
+    let root = std::env::temp_dir().join(format!("x11-integration-session-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).await.unwrap();
+    let path = root.join("session.json");
+    let session = Session::new("integrity goal");
+    session.save_to(&path).await.unwrap();
+    let raw = fs::read_to_string(&path).await.unwrap();
+    let tampered = raw.replacen("integrity goal", "tampered goal", 1);
+    fs::write(&path, tampered).await.unwrap();
+    assert!(Session::load_from(&path).await.is_err());
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn read_tool_denies_workspace_escape() {
+    let root = std::env::temp_dir().join(format!("x11-integration-tools-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).await.unwrap();
+    let result = ToolRegistry::builtins()
+        .execute(&ToolContext { workspace: root.clone() }, "read_file", serde_json::json!({"path":"../outside.txt"}))
+        .await;
+    assert!(result.is_err());
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn policy_deny_is_not_retroactively_overridden_by_default() {
+    let mut policy = Policy::default();
+    policy.rules.push(x11_permissions::Rule {
+        decision: Decision::Deny,
+        operation: Some(Operation::Shell),
+        pattern: Some("danger*".into()),
+    });
+    assert_eq!(policy.decide_for(Operation::Shell, "danger command"), Decision::Deny);
+    assert_eq!(policy.decide_for(Operation::Shell, "safe command"), Decision::Ask);
+}
+
+#[tokio::test]
+async fn context_compaction_preserves_tool_exchange() {
+    let mut context = Context::default();
+    context.push("system", "rules");
+    context.push("user", "goal");
+    for _ in 0..10 {
+        context.push_assistant_tool_calls(vec![x11_model::ToolCall {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path":"a"}),
+        }]);
+        context.push_tool_result("call-1", "result");
+    }
+    context.compact(200);
+    let messages = context.to_messages();
+    for pair in messages.windows(2) {
+        if !pair[0].tool_calls.is_empty() {
+            assert_eq!(pair[1].role, "tool");
+            assert_eq!(pair[1].tool_call_id.as_deref(), Some("call-1"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn provider_is_called_once_for_successful_completion() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = CountingProvider { calls: Arc::clone(&calls) };
+    let response = provider
+        .complete(CompletionRequest {
+            model: "counting".into(),
+            messages: vec![Message::user("hello")],
+            tools: vec![],
+            temperature: None,
+            max_tokens: Some(64),
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.text, "hello");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
