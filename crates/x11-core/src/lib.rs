@@ -1,4 +1,5 @@
 pub mod orchestration;
+pub mod verification;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
