@@ -29,12 +29,13 @@ impl ModelProvider for MockProvider {
 }
 
 #[derive(Clone)]
-pub struct OpenAiCompatible { pub base_url:String, pub api_key:String, pub client:Client }
+pub struct OpenAiCompatible { pub base_url:String, pub api_key:String, pub client:Client, pub max_retries:u32 }
 impl OpenAiCompatible {
     pub fn new(base_url:impl Into<String>,api_key:impl Into<String>)->Self{
         let client=Client::builder().timeout(Duration::from_secs(120)).connect_timeout(Duration::from_secs(15)).build().unwrap_or_else(|_|Client::new());
-        Self{base_url:base_url.into(),api_key:api_key.into(),client}
+        Self{base_url:base_url.into(),api_key:api_key.into(),client,max_retries:2}
     }
+    fn retryable(status:StatusCode)->bool { status==StatusCode::TOO_MANY_REQUESTS || status.is_server_error() }
 }
 
 #[derive(Debug, Deserialize)] struct ChatEnvelope { choices:Vec<ChatChoice>, #[serde(default)] usage:Option<UsageEnvelope> }
@@ -51,9 +52,19 @@ impl ModelProvider for OpenAiCompatible {
         let tools=if r.tools.is_empty(){None}else{Some(r.tools.iter().map(|t|serde_json::json!({"type":"function","function":{"name":t["name"],"description":t["description"],"parameters":t["input_schema"]}})).collect::<Vec<_>>())};
         let body=serde_json::json!({"model":r.model,"messages":r.messages,"temperature":r.temperature,"max_tokens":r.max_tokens,"tools":tools});
         let url=format!("{}/chat/completions",self.base_url.trim_end_matches('/'));
-        let response=self.client.post(url).bearer_auth(&self.api_key).json(&body).send().await.context("model request failed")?;
-        let status=response.status();
-        if !status.is_success(){let body=response.text().await.unwrap_or_default();let body=body.chars().take(4000).collect::<String>();anyhow::bail!("model API returned {}: {}",status,body)}
+        let mut attempt=0u32;
+        let response=loop {
+            let response=self.client.post(&url).bearer_auth(&self.api_key).json(&body).send().await.context("model request failed")?;
+            if response.status().is_success(){break response;}
+            let status=response.status();
+            if !Self::retryable(status)||attempt>=self.max_retries {
+                let body=response.text().await.unwrap_or_default();
+                let body=body.chars().take(4000).collect::<String>();
+                anyhow::bail!("model API returned {}: {}",status,body);
+            }
+            attempt+=1;
+            tokio::time::sleep(Duration::from_millis(250u64.saturating_mul(1u64<<attempt.min(4)))).await;
+        };
         let envelope=response.json::<ChatEnvelope>().await.context("invalid model response JSON")?;
         let choice=envelope.choices.first().context("model response contained no choices")?;
         let mut calls=Vec::new();
@@ -71,4 +82,4 @@ impl ModelProvider for OpenAiCompatible {
 }
 
 #[cfg(test)]
-mod tests { use super::*; #[tokio::test] async fn mock_provider_is_deterministic(){let p=MockProvider;let r=p.complete(CompletionRequest{model:"m".into(),messages:vec![Message{role:"user".into(),content:"hello".into()}],tools:vec![],temperature:None,max_tokens:None}).await.unwrap();assert_eq!(r.text,"Mock provider received: hello");assert!(r.tool_calls.is_empty());} }
+mod tests { use super::*; #[tokio::test] async fn mock_provider_is_deterministic(){let p=MockProvider;let r=p.complete(CompletionRequest{model:"m".into(),messages:vec![Message{role:"user".into(),content:"hello".into()}],tools:vec![],temperature:None,max_tokens:None}).await.unwrap();assert_eq!(r.text,"Mock provider received: hello");assert!(r.tool_calls.is_empty());} #[test] fn retry_policy_covers_transient_failures(){assert!(OpenAiCompatible::retryable(StatusCode::TOO_MANY_REQUESTS));assert!(OpenAiCompatible::retryable(StatusCode::BAD_GATEWAY));assert!(!OpenAiCompatible::retryable(StatusCode::BAD_REQUEST));}}
