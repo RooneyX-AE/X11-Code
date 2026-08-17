@@ -116,7 +116,7 @@ impl<P:ModelProvider> AgentRuntime<P>{
                     let success=out.status.success();
                     passed &= success;
                     let details=format!("{}\nstdout:\n{}\nstderr:\n{}",step.description,String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
-                    self.emit(AgentEvent::Verification{passed:success,summary:details});
+                    self.emit(AgentEvent::Verification{passed:success,summary:details.clone()});
                     self.context.push("verification",details);
                 }
                 Ok(Err(error))=>{
@@ -194,7 +194,7 @@ impl<P:ModelProvider> AgentRuntime<P>{
                 let result=self.tools.execute(&ToolContext{workspace:self.config.workspace.clone()},&call.name,call.arguments.clone()).await;
                 match result{
                     Ok(out)=>{self.context.push("tool",format!("{} => {}",call.name,out));self.emit(AgentEvent::ToolCompleted{call_id:id,success:true,output:out});}
-                    Err(e)=>{let msg=e.to_string();self.context.push("tool",format!("{} => ERROR: {}",call.name,msg));self.emit(AgentEvent::ToolCompleted{call_id:id,success:false,output:msg});self.emit(AgentEvent::Error{message:msg});}
+                    Err(e)=>{let msg=e.to_string();self.context.push("tool",format!("{} => ERROR: {}",call.name,msg.clone()));self.emit(AgentEvent::ToolCompleted{call_id:id,success:false,output:msg.clone()});self.emit(AgentEvent::Error{message:msg});}
                 }
                 self.run_hooks(HookEvent::AfterTool).await?;
             }
