@@ -1,139 +1,57 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::Value;
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::{Duration, Instant}};
-use tokio::{process::Command, sync::watch, time::timeout};
+use std::{collections::BTreeSet, env, path::{Path, PathBuf}, process::Command, sync::Arc, time::{Duration, Instant}};
+use tokio::{process::Command as TokioCommand, sync::watch, time::timeout};
 use uuid::Uuid;
-use x11_tools::{sandbox::{self, SandboxMode}, ToolContext, ToolKind, ToolRegistry};
+use x11_tools::{ToolContext, ToolKind, ToolRegistry};
 use crate::workspace_lock::WorkspaceLockManager;
 
-#[derive(Debug, Clone)]
-pub struct ToolExecutionRequest {
-    pub call_id: Uuid,
-    pub name: String,
-    pub arguments: Value,
-    pub timeout: Duration,
-    pub max_attempts: u32,
-    pub allowed_tools: Option<BTreeSet<String>>,
-    pub lock_key: Option<String>,
+mod sandbox {
+    use super::*;
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum Mode { Off, Auto, Strict }
+    impl Mode { pub fn parse(v: &str) -> Result<Self> { match v.to_ascii_lowercase().as_str() { "off" => Ok(Self::Off), "auto" => Ok(Self::Auto), "strict" => Ok(Self::Strict), other => anyhow::bail!("unknown sandbox mode '{other}'; use off, auto, or strict") } } }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum Backend { None, Bubblewrap, MacSeatbelt, WindowsAppContainer }
+    #[derive(Debug, Clone)] pub struct Capability { pub backend: Backend, pub filesystem_isolation: bool, pub network_isolation: bool, pub process_isolation: bool, pub reason: String }
+    pub fn detect() -> Capability {
+        if cfg!(target_os = "linux") { if find("bwrap").is_some() { return Capability{backend:Backend::Bubblewrap,filesystem_isolation:true,network_isolation:true,process_isolation:true,reason:"bubblewrap available".into()}; } return Capability{backend:Backend::None,filesystem_isolation:false,network_isolation:false,process_isolation:false,reason:"bubblewrap is not installed".into()}; }
+        if cfg!(target_os = "macos") { let ok=Path::new("/usr/bin/sandbox-exec").is_file(); return Capability{backend:if ok{Backend::MacSeatbelt}else{Backend::None},filesystem_isolation:ok,network_isolation:ok,process_isolation:ok,reason:if ok{"macOS Seatbelt available"}else{"macOS sandbox backend unavailable"}.into()}; }
+        if cfg!(target_os = "windows") { return Capability{backend:Backend::WindowsAppContainer,filesystem_isolation:false,network_isolation:false,process_isolation:false,reason:"Windows AppContainer integration is not enabled yet".into()}; }
+        Capability{backend:Backend::None,filesystem_isolation:false,network_isolation:false,process_isolation:false,reason:"no supported sandbox backend".into()}
+    }
+    pub fn validate(mode:Mode)->Result<Capability>{let c=detect();if mode==Mode::Strict&&c.backend==Backend::None{anyhow::bail!("strict sandbox unavailable: {}",c.reason)}if mode==Mode::Strict&&cfg!(target_os="windows"){anyhow::bail!("strict sandbox is not available on Windows yet")}Ok(c)}
+    pub fn wrap(mode:Mode,workspace:&Path,program:&Path,args:&[String])->Result<(PathBuf,Vec<String>,Backend)>{let c=validate(mode)?;match(mode,c.backend){(Mode::Off,_)|(Mode::Auto,Backend::None)=>Ok((program.to_path_buf(),args.to_vec(),Backend::None)),(_,Backend::Bubblewrap)=>{let b=find("bwrap").context("bubblewrap disappeared")?;let cwd=workspace.canonicalize().context("canonicalize workspace")?;let mut a=vec!["--die-with-parent".into(),"--new-session".into(),"--unshare-pid".into(),"--unshare-uts".into(),"--unshare-ipc".into(),"--unshare-net".into(),"--proc".into(),"/proc".into(),"--dev".into(),"/dev".into(),"--ro-bind".into(),"/usr".into(),"/usr".into(),"--ro-bind".into(),"/bin".into(),"/bin".into()];if Path::new("/lib").is_dir(){a.extend(["--ro-bind".into(),"/lib".into(),"/lib".into()]);}if Path::new("/lib64").is_dir(){a.extend(["--ro-bind".into(),"/lib64".into(),"/lib64".into()]);}a.extend(["--bind".into(),cwd.display().to_string(),cwd.display().to_string(),"--chdir".into(),cwd.display().to_string(),"--".into(),program.display().to_string()]);a.extend(args.iter().cloned());Ok((b,a,Backend::Bubblewrap))},(_,Backend::MacSeatbelt)=>{let cwd=workspace.canonicalize().context("canonicalize workspace")?;let p=cwd.to_string_lossy().replace('"',"\\\"");let profile=format!("(version 1) (deny default) (allow process*) (allow file-read*) (allow file-write* (subpath \"{p}\")) (allow file-read* (subpath \"{p}\")) (deny network*)");let mut a=vec!["-p".into(),profile,program.display().to_string()];a.extend(args.iter().cloned());Ok((PathBuf::from("/usr/bin/sandbox-exec"),a,Backend::MacSeatbelt))},(_,Backend::WindowsAppContainer)=>Ok((program.to_path_buf(),args.to_vec(),Backend::WindowsAppContainer)),(_,Backend::None)=>Ok((program.to_path_buf(),args.to_vec(),Backend::None))}}
+    fn find(name:&str)->Option<PathBuf>{let p=env::var_os("PATH")?;for root in env::split_paths(&p){let c=root.join(name);if c.is_file(){return Some(c)}if cfg!(windows){for s in [".exe",".cmd"]{let c=root.join(format!("{name}{s}"));if c.is_file(){return Some(c)}}}}None}
 }
+
 #[derive(Debug, Clone)]
-pub struct ToolExecutionResult { pub call_id: Uuid, pub tool: String, pub success: bool, pub output: String, pub duration: Duration, pub attempts: u32, pub timed_out: bool, pub cancelled: bool }
+pub struct ToolExecutionRequest { pub call_id:Uuid,pub name:String,pub arguments:Value,pub timeout:Duration,pub max_attempts:u32,pub allowed_tools:Option<BTreeSet<String>>,pub lock_key:Option<String> }
+#[derive(Debug, Clone)]
+pub struct ToolExecutionResult { pub call_id:Uuid,pub tool:String,pub success:bool,pub output:String,pub duration:Duration,pub attempts:u32,pub timed_out:bool,pub cancelled:bool }
 #[derive(Clone)]
-pub struct ToolExecutor { registry: ToolRegistry, workspace: PathBuf, locks: WorkspaceLockManager, default_allowed_tools: Option<Arc<BTreeSet<String>>>, sandbox_mode: SandboxMode }
+pub struct ToolExecutor { registry:ToolRegistry,workspace:PathBuf,locks:WorkspaceLockManager,default_allowed_tools:Option<Arc<BTreeSet<String>>>,sandbox_mode:sandbox::Mode }
 
 impl ToolExecutor {
-    pub fn new(registry: ToolRegistry, workspace: PathBuf) -> Self { Self { registry, workspace, locks: WorkspaceLockManager::default(), default_allowed_tools: None, sandbox_mode: SandboxMode::Auto } }
-    pub fn with_locks(registry: ToolRegistry, workspace: PathBuf, locks: WorkspaceLockManager) -> Self { Self { registry, workspace, locks, default_allowed_tools: None, sandbox_mode: SandboxMode::Auto } }
-    pub fn with_locks_and_allowlist(registry: ToolRegistry, workspace: PathBuf, locks: WorkspaceLockManager, allowed: BTreeSet<String>) -> Self { Self { registry, workspace, locks, default_allowed_tools: Some(Arc::new(allowed)), sandbox_mode: SandboxMode::Auto } }
-    pub fn with_sandbox_mode(mut self, mode: SandboxMode) -> Self { self.sandbox_mode = mode; self }
-    pub fn sandbox_mode(&self) -> SandboxMode { self.sandbox_mode }
-    pub fn with_registry(&self, registry: ToolRegistry) -> Self { Self { registry, workspace: self.workspace.clone(), locks: self.locks.clone(), default_allowed_tools: self.default_allowed_tools.clone(), sandbox_mode: self.sandbox_mode } }
-
-    fn allowed(name: &str, rules: Option<&BTreeSet<String>>) -> bool {
-        let Some(rules) = rules else { return true; };
-        if rules.is_empty() { return false; }
-        rules.iter().any(|rule| rule == "*" || rule == name || (rule.ends_with('*') && name.starts_with(rule.trim_end_matches('*'))))
-    }
-
-    fn lock_key(&self, req: &ToolExecutionRequest) -> Option<String> {
-        if let Some(key) = &req.lock_key { return Some(key.clone()); }
-        let tool = self.registry.get(&req.name)?;
-        match tool.kind() {
-            ToolKind::FilesystemWrite => req.arguments["path"].as_str().map(|p| format!("file:{p}")),
-            ToolKind::Shell | ToolKind::GitWrite => Some("workspace:global".into()),
-            _ => None,
-        }
-    }
-
-    async fn execute_process_tool(&self, req: &ToolExecutionRequest, cancel: &mut watch::Receiver<bool>) -> Option<Result<String>> {
-        let (program, args): (PathBuf, Vec<String>) = match req.name.as_str() {
-            "shell" => {
-                let command = req.arguments["command"].as_str()?;
-                let mut args = Vec::new();
-                if cfg!(windows) { args.extend(["/C".into(), command.into()]); } else { args.extend(["-lc".into(), command.into()]); }
-                (if cfg!(windows) { PathBuf::from("cmd") } else { PathBuf::from("sh") }, args)
-            }
-            "git" => {
-                let values = req.arguments["args"].as_array()?;
-                let args = values.iter().map(|v| v.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>()?;
-                (PathBuf::from("git"), args)
-            }
-            "git_status" => (PathBuf::from("git"), vec!["status".into(), "--short".into(), "--branch".into()]),
-            "git_diff" => {
-                let cached = req.arguments["cached"].as_bool().unwrap_or(false);
-                (PathBuf::from("git"), if cached { vec!["diff".into(), "--cached".into(), "--".into()] } else { vec!["diff".into(), "--".into()] })
-            }
-            _ => return None,
-        };
-
-        let wrapped = match sandbox::wrap_command(self.sandbox_mode, &self.workspace, &program, &args) {
-            Ok(value) => value,
-            Err(error) => return Some(Err(error)),
-        };
-        let (program, args, _backend) = wrapped;
-        let mut command = Command::new(program);
-        command.args(args).current_dir(&self.workspace);
-        if *cancel.borrow() { return Some(Ok("cancelled before sandboxed process".into())); }
-        let child = command.output();
-        tokio::pin!(child);
-        let result = tokio::select! {
-            value = &mut child => value.map_err(Into::into),
-            changed = cancel.changed() => {
-                if changed.is_err() || *cancel.borrow() { Err(anyhow::anyhow!("execution cancelled")) } else { child.await.map_err(Into::into) }
-            }
-        };
-        Some(result.map(|output| format!("exit={}\nstdout:\n{}\nstderr:\n{}", output.status.code().unwrap_or(-1), String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr))))
-    }
-
-    pub async fn execute(&self, req: ToolExecutionRequest, mut cancel: watch::Receiver<bool>) -> Result<ToolExecutionResult> {
-        if self.registry.get(&req.name).is_none() { anyhow::bail!("unknown tool: {}", req.name); }
-        let configured = req.allowed_tools.as_ref().or(self.default_allowed_tools.as_deref());
-        if !Self::allowed(&req.name, configured) { anyhow::bail!("tool '{}' is outside the agent allowlist", req.name); }
-        let _lock = match self.lock_key(&req) { Some(key) => Some(self.locks.acquire(key).await), None => None };
-        let started = Instant::now();
-        let attempts = req.max_attempts.clamp(1, 3);
-        let mut last_error = String::new();
-        for attempt in 1..=attempts {
-            if *cancel.borrow() {
-                return Ok(ToolExecutionResult { call_id:req.call_id, tool:req.name.clone(), success:false, output:"cancelled before execution".into(), duration:started.elapsed(), attempts:attempt-1, timed_out:false, cancelled:true });
-            }
-            let process_result = self.execute_process_tool(&req, &mut cancel).await;
-            let result = match process_result {
-                Some(value) => value,
-                None => self.registry.execute(&ToolContext { workspace:self.workspace.clone() }, &req.name, req.arguments.clone()).await,
-            };
-            match timeout(req.timeout, async { result }).await {
-                Ok(Ok(output)) => return Ok(ToolExecutionResult { call_id:req.call_id, tool:req.name.clone(), success:true, output, duration:started.elapsed(), attempts:attempt, timed_out:false, cancelled:false }),
-                Ok(Err(error)) => {
-                    last_error = error.to_string();
-                    if *cancel.borrow() { return Ok(ToolExecutionResult { call_id:req.call_id, tool:req.name.clone(), success:false, output:last_error, duration:started.elapsed(), attempts:attempt, timed_out:false, cancelled:true }); }
-                    if attempt == attempts { return Ok(ToolExecutionResult { call_id:req.call_id, tool:req.name.clone(), success:false, output:last_error, duration:started.elapsed(), attempts:attempt, timed_out:false, cancelled:false }); }
-                }
-                Err(_) => {
-                    last_error = format!("tool timed out after {} ms", req.timeout.as_millis());
-                    if attempt == attempts { return Ok(ToolExecutionResult { call_id:req.call_id, tool:req.name.clone(), success:false, output:last_error, duration:started.elapsed(), attempts:attempt, timed_out:true, cancelled:false }); }
-                }
-            }
-        }
-        Ok(ToolExecutionResult { call_id:req.call_id, tool:req.name, success:false, output:last_error, duration:started.elapsed(), attempts, timed_out:false, cancelled:false })
-    }
+    pub fn new(registry:ToolRegistry,workspace:PathBuf)->Self{Self{registry,workspace,locks:WorkspaceLockManager::default(),default_allowed_tools:None,sandbox_mode:sandbox::Mode::Auto}}
+    pub fn with_locks(registry:ToolRegistry,workspace:PathBuf,locks:WorkspaceLockManager)->Self{Self{registry,workspace,locks,default_allowed_tools:None,sandbox_mode:sandbox::Mode::Auto}}
+    pub fn with_locks_and_allowlist(registry:ToolRegistry,workspace:PathBuf,locks:WorkspaceLockManager,allowed:BTreeSet<String>)->Self{Self{registry,workspace,locks,default_allowed_tools:Some(Arc::new(allowed)),sandbox_mode:sandbox::Mode::Auto}}
+    pub fn with_sandbox_mode(mut self,mode:&str)->Result<Self>{self.sandbox_mode=sandbox::Mode::parse(mode)?;Ok(self)}
+    pub fn sandbox_backend()->sandbox::Capability{sandbox::detect()}
+    pub fn with_registry(&self,registry:ToolRegistry)->Self{Self{registry,workspace:self.workspace.clone(),locks:self.locks.clone(),default_allowed_tools:self.default_allowed_tools.clone(),sandbox_mode:self.sandbox_mode}}
+    fn allowed(name:&str,rules:Option<&BTreeSet<String>>)->bool{let Some(rules)=rules else{return true};if rules.is_empty(){return false}rules.iter().any(|rule|rule=="*"||rule==name||(rule.ends_with('*')&&name.starts_with(rule.trim_end_matches('*'))))}
+    fn lock_key(&self,req:&ToolExecutionRequest)->Option<String>{if let Some(k)=&req.lock_key{return Some(k.clone())}let tool=self.registry.get(&req.name)?;match tool.kind(){ToolKind::FilesystemWrite=>req.arguments["path"].as_str().map(|p|format!("file:{p}")),ToolKind::Shell|ToolKind::GitWrite=>Some("workspace:global".into()),_=>None}}
+    async fn execute_process_tool(&self,req:&ToolExecutionRequest,cancel:&mut watch::Receiver<bool>)->Option<Result<String>>{let(kind,args):(PathBuf,Vec<String>)=match req.name.as_str(){"shell"=>{let command=req.arguments["command"].as_str()?;((if cfg!(windows){PathBuf::from("cmd")}else{PathBuf::from("sh")}),if cfg!(windows){vec!["/C".into(),command.into()]}else{vec!["-lc".into(),command.into()]})},"git"=>{let v=req.arguments["args"].as_array()?;let a=v.iter().map(|x|x.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>()?;(PathBuf::from("git"),a)},"git_status"=>(PathBuf::from("git"),vec!["status".into(),"--short".into(),"--branch".into()]),"git_diff"=>(PathBuf::from("git"),if req.arguments["cached"].as_bool().unwrap_or(false){vec!["diff".into(),"--cached".into(),"--".into()]}else{vec!["diff".into(),"--".into()]}),_=>return None};let (program,args,_backend)=match sandbox::wrap(self.sandbox_mode,&self.workspace,&kind,&args){Ok(v)=>v,Err(e)=>return Some(Err(e))};if *cancel.borrow(){return Some(Ok("cancelled before sandboxed process".into()))}let mut command=TokioCommand::new(program);command.args(args).current_dir(&self.workspace);let child=command.output();tokio::pin!(child);let result=tokio::select!{value=&mut child=>value.map_err(Into::into),changed=cancel.changed()=>{if changed.is_err()||*cancel.borrow(){Err(anyhow::anyhow!("execution cancelled"))}else{child.await.map_err(Into::into)}}};Some(result.map(|o|format!("exit={}\nstdout:\n{}\nstderr:\n{}",o.status.code().unwrap_or(-1),String::from_utf8_lossy(&o.stdout),String::from_utf8_lossy(&o.stderr))))}
+    pub async fn execute(&self,req:ToolExecutionRequest,mut cancel:watch::Receiver<bool>)->Result<ToolExecutionResult>{if self.registry.get(&req.name).is_none(){anyhow::bail!("unknown tool: {}",req.name)}let configured=req.allowed_tools.as_ref().or(self.default_allowed_tools.as_deref());if !Self::allowed(&req.name,configured){anyhow::bail!("tool '{}' is outside the agent allowlist",req.name)}let _lock=match self.lock_key(&req){Some(k)=>Some(self.locks.acquire(k).await),None=>None};let started=Instant::now();let attempts=req.max_attempts.clamp(1,3);let mut last_error=String::new();for attempt in 1..=attempts{if *cancel.borrow(){return Ok(ToolExecutionResult{call_id:req.call_id,tool:req.name.clone(),success:false,output:"cancelled before execution".into(),duration:started.elapsed(),attempts:attempt-1,timed_out:false,cancelled:true})}let process=self.execute_process_tool(&req,&mut cancel).await;let result=match process{Some(v)=>v,None=>self.registry.execute(&ToolContext{workspace:self.workspace.clone()},&req.name,req.arguments.clone()).await};match timeout(req.timeout,async{result}).await{Ok(Ok(output))=>return Ok(ToolExecutionResult{call_id:req.call_id,tool:req.name.clone(),success:true,output,duration:started.elapsed(),attempts:attempt,timed_out:false,cancelled:false}),Ok(Err(error))=>{last_error=error.to_string();if *cancel.borrow(){return Ok(ToolExecutionResult{call_id:req.call_id,tool:req.name.clone(),success:false,output:last_error,duration:started.elapsed(),attempts:attempt,timed_out:false,cancelled:true})}if attempt==attempts{return Ok(ToolExecutionResult{call_id:req.call_id,tool:req.name.clone(),success:false,output:last_error,duration:started.elapsed(),attempts:attempt,timed_out:false,cancelled:false})}},Err(_)=>{last_error=format!("tool timed out after {} ms",req.timeout.as_millis());if attempt==attempts{return Ok(ToolExecutionResult{call_id:req.call_id,tool:req.name.clone(),success:false,output:last_error,duration:started.elapsed(),attempts:attempt,timed_out:true,cancelled:false})}}}}Ok(ToolExecutionResult{call_id:req.call_id,tool:req.name,success:false,output:last_error,duration:started.elapsed(),attempts,timed_out:false,cancelled:false})}
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*; use serde_json::json; use std::collections::BTreeSet; use tokio::time::sleep;
-    fn req(name:&str, args:Value, allowed:Option<BTreeSet<String>>) -> ToolExecutionRequest { ToolExecutionRequest{call_id:Uuid::new_v4(),name:name.into(),arguments:args,timeout:Duration::from_secs(2),max_attempts:1,allowed_tools:allowed,lock_key:None} }
-    #[tokio::test] async fn unknown_tool_is_rejected(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap());let(_tx,rx)=watch::channel(false);assert!(ex.execute(req("missing",json!({}),None),rx).await.is_err());}
-    #[tokio::test] async fn allowlist_is_enforced_at_execution(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap());let(_tx,rx)=watch::channel(false);let mut allowed=BTreeSet::new();allowed.insert("read_file".into());assert!(ex.execute(req("git_status",json!({}),Some(allowed)),rx).await.is_err());}
-    #[tokio::test] async fn wildcard_allowlist_works(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap());let(_tx,rx)=watch::channel(false);let mut allowed=BTreeSet::new();allowed.insert("git_*".into());let result=ex.execute(req("git_status",json!({}),Some(allowed)),rx).await.unwrap();assert!(result.success);}
-    #[tokio::test] async fn read_tool_executes(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap());let(_tx,rx)=watch::channel(false);let result=ex.execute(req("read_file",json!({"path":"Cargo.toml"}),None),rx).await.unwrap();assert!(result.success);}
-    #[tokio::test] async fn sandbox_mode_is_configurable(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap()).with_sandbox_mode(SandboxMode::Off);assert_eq!(ex.sandbox_mode(),SandboxMode::Off);}
-
-    struct SlowTool;
-    #[async_trait::async_trait]
-    impl x11_tools::Tool for SlowTool { fn name(&self)->&str{"slow_test"} fn description(&self)->&str{"test-only slow tool"} fn kind(&self)->ToolKind{ToolKind::ReadOnly} fn input_schema(&self)->Value{json!({"type":"object","additionalProperties":false})} async fn execute(&self,_:&ToolContext,_:Value)->Result<String>{sleep(Duration::from_millis(40)).await;Ok("done".into())} }
-    fn slow_executor() -> ToolExecutor { let mut registry=ToolRegistry::builtins(); registry.register(SlowTool); ToolExecutor::new(registry,std::env::current_dir().unwrap()) }
-    #[tokio::test] async fn timeout_retries_but_stays_bounded(){let ex=slow_executor();let(_tx,rx)=watch::channel(false);let mut request=req("slow_test",json!({}),None);request.timeout=Duration::from_millis(5);request.max_attempts=3;let result=ex.execute(request,rx).await.unwrap();assert!(!result.success);assert!(result.timed_out);assert_eq!(result.attempts,3);}
-    #[tokio::test] async fn cancellation_does_not_retry(){let ex=slow_executor();let(tx,rx)=watch::channel(false);let mut request=req("slow_test",json!({}),None);request.timeout=Duration::from_millis(500);request.max_attempts=3;let task=tokio::spawn(async move{ex.execute(request,rx).await.unwrap()});sleep(Duration::from_millis(5)).await;tx.send(true).unwrap();let result=task.await.unwrap();assert!(!result.success);assert!(result.cancelled);assert_eq!(result.attempts,0);}
-    #[tokio::test] async fn registry_replacement_preserves_allowlist(){let mut allowed=BTreeSet::new();allowed.insert("read_file".into());let base=ToolExecutor::with_locks_and_allowlist(ToolRegistry::builtins(),std::env::current_dir().unwrap(),WorkspaceLockManager::default(),allowed);let replaced=base.with_registry(ToolRegistry::builtins());let(_tx,rx)=watch::channel(false);assert!(replaced.execute(req("git_status",json!({}),None),rx).await.is_err());assert!(replaced.execute(req("read_file",json!({"path":"Cargo.toml"}),None),rx).await.unwrap().success);}
+mod tests{use super::*;use serde_json::json;use std::collections::BTreeSet;use tokio::time::sleep;fn req(name:&str,args:Value,allowed:Option<BTreeSet<String>>)->ToolExecutionRequest{ToolExecutionRequest{call_id:Uuid::new_v4(),name:name.into(),arguments:args,timeout:Duration::from_secs(2),max_attempts:1,allowed_tools:allowed,lock_key:None}}
+#[tokio::test]async fn unknown_tool_is_rejected(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap());let(_tx,rx)=watch::channel(false);assert!(ex.execute(req("missing",json!({}),None),rx).await.is_err())}
+#[tokio::test]async fn allowlist_is_enforced_at_execution(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap());let(_tx,rx)=watch::channel(false);let mut a=BTreeSet::new();a.insert("read_file".into());assert!(ex.execute(req("git_status",json!({}),Some(a)),rx).await.is_err())}
+#[tokio::test]async fn wildcard_allowlist_works(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap());let(_tx,rx)=watch::channel(false);let mut a=BTreeSet::new();a.insert("git_*".into());let r=ex.execute(req("git_status",json!({}),Some(a)),rx).await.unwrap();assert!(r.success)}
+#[tokio::test]async fn read_tool_executes(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap());let(_tx,rx)=watch::channel(false);let r=ex.execute(req("read_file",json!({"path":"Cargo.toml"}),None),rx).await.unwrap();assert!(r.success)}
+#[tokio::test]async fn sandbox_mode_is_configurable(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap()).with_sandbox_mode("off").unwrap();assert_eq!(ex.sandbox_mode,sandbox::Mode::Off)}
+#[tokio::test]async fn strict_mode_fails_closed_when_backend_is_missing(){if sandbox::detect().backend==sandbox::Backend::None{let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap()).with_sandbox_mode("strict").unwrap();let(_tx,rx)=watch::channel(false);let r=ex.execute(req("git_status",json!({}),None),rx).await.unwrap();assert!(!r.success)}}
+struct SlowTool;#[async_trait::async_trait]impl x11_tools::Tool for SlowTool{fn name(&self)->&str{"slow_test"}fn description(&self)->&str{"test-only slow tool"}fn kind(&self)->ToolKind{ToolKind::ReadOnly}fn input_schema(&self)->Value{json!({"type":"object"})}async fn execute(&self,_:&ToolContext,_:Value)->Result<String>{sleep(Duration::from_millis(40)).await;Ok("done".into())}}
+#[tokio::test]async fn timeout_retries_but_stays_bounded(){let mut r=ToolRegistry::builtins();r.register(SlowTool);let ex=ToolExecutor::new(r,std::env::current_dir().unwrap());let(_tx,rx)=watch::channel(false);let mut q=req("slow_test",json!({}),None);q.timeout=Duration::from_millis(5);q.max_attempts=3;let out=ex.execute(q,rx).await.unwrap();assert!(!out.success);assert!(out.timed_out);assert_eq!(out.attempts,3)}
+#[tokio::test]async fn cancellation_does_not_retry(){let ex=ToolExecutor::new(ToolRegistry::builtins(),std::env::current_dir().unwrap());let(tx,rx)=watch::channel(false);let mut q=req("git_status",json!({}),None);q.timeout=Duration::from_millis(500);q.max_attempts=3;let task=tokio::spawn(async move{ex.execute(q,rx).await.unwrap()});sleep(Duration::from_millis(5)).await;tx.send(true).unwrap();let out=task.await.unwrap();assert!(!out.success);assert!(out.cancelled)}
 }
