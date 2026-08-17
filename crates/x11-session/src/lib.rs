@@ -1,3 +1,5 @@
+pub mod store;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::{path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH}};
@@ -6,22 +8,12 @@ use uuid::Uuid;
 use x11_protocol::AgentEvent;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Checkpoint {
-    pub id: Uuid,
-    pub created_at: u64,
-    pub event_count: usize,
-    pub note: String,
-}
+pub struct Checkpoint { pub id: Uuid, pub created_at: u64, pub event_count: usize, pub note: String }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
-    pub id:Uuid,
-    pub goal:String,
-    pub created_at:u64,
-    pub updated_at:u64,
-    pub events:Vec<AgentEvent>,
-    #[serde(default)]
-    pub checkpoints:Vec<Checkpoint>,
+    pub id:Uuid, pub goal:String, pub created_at:u64, pub updated_at:u64, pub events:Vec<AgentEvent>,
+    #[serde(default)] pub checkpoints:Vec<Checkpoint>,
 }
 impl Session {
  pub fn new(goal:impl Into<String>)->Self{let now=now();Self{id:Uuid::new_v4(),goal:goal.into(),created_at:now,updated_at:now,events:Vec::new(),checkpoints:Vec::new()}}
@@ -38,7 +30,4 @@ fn temporary_path(path:&Path)->PathBuf{let mut p=path.to_path_buf();p.set_extens
 fn now()->u64{SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()}
 
 #[cfg(test)]
-mod tests {
- use super::*;
- #[test] fn fork_gets_new_identity(){let mut s=Session::new("one");s.append(AgentEvent::Error{message:"x".into()});let f=s.fork("two");assert_ne!(s.id,f.id);assert_eq!(f.goal,"two");assert!(!f.checkpoints.is_empty());}
-}
+mod tests { use super::*; #[test] fn fork_gets_new_identity(){let mut s=Session::new("one");s.append(AgentEvent::Error{message:"x".into()});let f=s.fork("two");assert_ne!(s.id,f.id);assert_eq!(f.goal,"two");assert!(!f.checkpoints.is_empty());} }
