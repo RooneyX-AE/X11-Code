@@ -3,10 +3,13 @@ name="x11-cli"
 version.workspace=true
 edition.workspace=true
 license.workspace=true
+
 [dependencies]
 anyhow.workspace=true
 clap.workspace=true
 tokio.workspace=true
 tracing-subscriber.workspace=true
+uuid.workspace=true
 x11-agent={path="../x11-agent"}
 x11-model={path="../x11-model"}
+x11-session={path="../x11-session"}
