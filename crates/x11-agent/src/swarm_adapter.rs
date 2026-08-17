@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use x11_core::SubagentSpec;
 use x11_model::ModelProvider;
-use crate::{manager::{AgentManager, AgentManagerConfig, SubagentResult, SwarmReport}, AgentConfig, AgentRuntime};
+use crate::{manager::{AgentManager, AgentManagerConfig, SubagentResult, SwarmReport}, swarm_reviewer::{ReviewResult, SwarmReviewer}, AgentConfig, AgentRuntime};
 
 pub struct SwarmAdapter;
 
@@ -14,6 +14,9 @@ impl SwarmAdapter {
     ) -> Result<SwarmReport> {
         config.inherited_policy = Some(parent.policy.clone());
         config.cancellation = Some(parent.cancel.clone());
+        if config.state_path.is_none() {
+            config.state_path = Some(parent.swarm_state_path());
+        }
         let manager = AgentManager::new(
             Arc::clone(&parent.provider),
             parent.config.workspace.clone(),
@@ -21,6 +24,20 @@ impl SwarmAdapter {
             config,
         );
         manager.run_report(specs).await
+    }
+
+    pub fn review(report: &SwarmReport) -> ReviewResult {
+        SwarmReviewer::review(report)
+    }
+
+    pub async fn run_reviewed<P: ModelProvider + 'static>(
+        parent: &AgentRuntime<P>,
+        specs: Vec<SubagentSpec>,
+        config: AgentManagerConfig,
+    ) -> Result<(SwarmReport, ReviewResult)> {
+        let report = Self::run_with_parent(parent, specs, config).await?;
+        let review = Self::review(&report);
+        Ok((report, review))
     }
 
     pub async fn run_results<P: ModelProvider + 'static>(
@@ -56,5 +73,6 @@ mod tests {
         let report = SwarmAdapter::run_with_parent(&parent, vec![spec()], AgentManagerConfig { max_concurrency: 1, timeout_ms: 5_000, ..Default::default() }).await.unwrap();
         assert_eq!(report.results.len(), 1);
         assert_eq!(report.succeeded, 1);
+        assert_eq!(SwarmAdapter::review(&report).verdict, crate::swarm_reviewer::ReviewVerdict::Accept);
     }
 }
